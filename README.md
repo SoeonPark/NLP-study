@@ -1,2 +1,1 @@
-# NLP-study
-part of FootPrints for Basic study during Summer
+Notes by a Student who started to study NLP
