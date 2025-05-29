@@ -135,7 +135,7 @@ class LlamaAttention(nn.Module):
     
     """
     def forward(): 
-        This method implements the forward pass of the attention layer
+        Forward pass of a multi-head attention layer with rotary embeddings and optional caching
         - hidden_states: Input tensor of shape (batch_size, seq_length, hidden_size)
         - position_embeddings: Tuple containing the cosine and sine embeddings for the rotary positional embedding
         - attention_mask: Optional tensor for masking attention scores
@@ -166,10 +166,25 @@ class LlamaAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = eager_attention_forward
+        attention_interface: Callable = eager_attention_forward # Callable implementing the Actual Attention(e.g., eager, flash, etc.)
+        if self.config._attn_implementation != "eager": # eager_attention_forward is the default attention implementation
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if self.config._attn_implementation
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout = 0.0 if not self.training else self.attention_dropout,
+            scaling = self.scaling,
+            **kwargs,
+        )
 
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous() # Flatten Multi-Headed Outputs back to (batch_size, seq_length, hidden_size)
+        attn_output = self.o_proj(attn_output) # Final Linear Projection back to hidden size
+        return attn_output, attn_weights
+        
 
 class LlamaDecoderLayer(GradientCheckpointingLayer):
 
