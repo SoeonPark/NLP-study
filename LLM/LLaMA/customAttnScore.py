@@ -7,12 +7,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # Attention Bias 생성 함수
 # ------------------------
 def compute_attn_bias(tokens, key_token_indices, scale=2.0):
-    seq_len = len(tokens)
-    bias_matrix = torch.zeros((1, 1, seq_len, seq_len))  # [1, 1, seq_len, seq_len]
+    sequery_len = len(tokens)
+    bias_matrix = torch.zeros((1, 1, sequery_len, sequery_len))  # [1, 1, sequery_len, sequery_len]
 
-    for i in range(seq_len):
+    for i in range(sequery_len):
         for j in key_token_indices:
-            if 0 <= j < seq_len:
+            if 0 <= j < sequery_len:
                 bias_matrix[0, 0, i, j] += scale
 
     return bias_matrix
@@ -30,16 +30,16 @@ class CustomLlamaAttention(LlamaAttention):
         output_attentions=False,
         **kwargs,
     ):
-        bsz, q_len, _ = hidden_states.size()
+        batch_size, query_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        query_states = self.q_proj(hidden_states).view(batch_size, query_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(batch_size, query_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(batch_size, query_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         attn_scores = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if "attention_bias" in kwargs:
-            attn_scores = attn_scores + kwargs["attention_bias"]  # shape: [bsz, num_heads, q_len, q_len]
+            attn_scores = attn_scores + kwargs["attention_bias"]  # shape: [batch_size, num_heads, query_len, query_len]
 
         if attention_mask is not None:
             attn_scores = attn_scores + attention_mask
@@ -47,7 +47,7 @@ class CustomLlamaAttention(LlamaAttention):
         attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
         attn_output = torch.matmul(attn_weights, value_states)
 
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, query_len, -1)
         attn_output = self.o_proj(attn_output)
 
         if output_attentions:
