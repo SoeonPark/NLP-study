@@ -6,6 +6,7 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from torch.nn import CrossEntropyLoss
+import os
 
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
@@ -14,54 +15,122 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
 model.eval()
 
+loss_fcn = CrossEntropyLoss(ignore_index = -100, reduction="none") # Ignore Tokens that are not part of the answer
+
 def compute_ppl(context: str, question: str, answer: str) -> float:
-    text = f"Context: {context}\nQuestion: {question}\nAnswer: {answer}"
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    text = f"Context: {context}\nQuestion: {question}\nAnswer: "
+    text_encoded = tokenizer(text, return_tensors="pt", truncation=True, add_special_tokens = False, max_length=1024).to(device)
+    answer_encoded = tokenizer(answer, return_tensors="pt", truncation=True, add_special_tokens = False, max_length=512).to(device)
+
+    text_ids = text_encoded["input_ids"][0]
+    answer_ids = answer_encoded["input_ids"][0]
+
+    input_ids = torch.cat([text_ids, answer_ids], dim=0).unsqueeze(0) 
+    attention_mask = torch.ones_like(input_ids).to(device)
+
+    labels = input_ids.clone()
+    labels[:, :text_ids.shape[0]] = -100
 
     with torch.no_grad():
-        outputs = model(**inputs, labels=inputs["input_ids"])
-    loss = outputs.loss
+        outputs = model(
+            input_ids = input_ids, 
+            attention_mask = attention_mask, 
+            labels=labels
+        )
+        loss = outputs.loss
 
     return torch.exp(loss).item()
 
 def compute_question_only_ppl(question: str, answer: str) -> float:
-    text = f"Question: {question}\nAnswer: {answer}"
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    text = f"Question: {question}\nAnswer: "
+    text_encoded = tokenizer(text, return_tensors="pt", truncation=True, add_special_tokens = False, max_length=1024).to(device)
+    answer_encoded = tokenizer(answer, return_tensors="pt", truncation=True, add_special_tokens = False, max_length=512).to(device)
+
+    text_ids = text_encoded["input_ids"][0]
+    answer_ids = answer_encoded["input_ids"][0]
+
+    input_ids = torch.cat([text_ids, answer_ids], dim=0).unsqueeze(0) 
+    attention_mask = torch.ones_like(input_ids).to(device)
+
+    labels = input_ids.clone()
+    labels[:, :text_ids.shape[0]] = -100
 
     with torch.no_grad():
-        outputs = model(**inputs, labels=inputs["input_ids"])
+        outputs = model(
+            input_ids = input_ids, 
+            attention_mask = attention_mask, 
+            labels=labels
+        )
+        loss = outputs.loss
 
-    return torch.exp(outputs.loss).item()
+    return torch.exp(loss).item()
 
 def compute_few_shot_ppl(question: str, answer: str, examples: list) -> float:
+    template = {
+        "question": "다음 문장에서 어문 규범에 부합하지 않는 부분을 찾아 고치고, 그 이유를 설명하세요.\n\"오늘은 퍼즐 마추기를 해 볼 거예요.\"",
+        "answer": "\"오늘은 퍼즐 맞추기를 해 볼 거예요.\"가 옳다. '제자리에 맞게 붙이다, 주문하다, 똑바르게 하다, 비교하다' 등의 뜻이 있는 말은 '마추다'가 아닌 '맞추다'로 적는다."
+    }
+
+    prompt = ""
+    
+    for ex in examples:
+        prompt += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
+    prompt += f"Question: {question}\nAnswer: "
+
+    prompt_encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    answer_encoded = tokenizer(answer, return_tensors="pt", truncation=True, max_length=512).to(device)
+
+    prompt_ids = prompt_encoded["input_ids"][0]
+    answer_ids = answer_encoded["input_ids"][0]
+
+    input_ids = torch.cat([prompt_ids, answer_ids], dim=0).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids).to(device)
+
+    labels = input_ids.clone()
+    labels[:, :prompt_ids.shape[0]] = -100
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids = input_ids, 
+            attention_mask = attention_mask, 
+            labels=labels
+        )
+        loss = outputs.loss
+
+    return torch.exp(loss).item()
+
+def compute_context_few_shot_ppl(context: str, question: str, answer: str, examples: list) -> float:
+    template = {
+        "question": "다음 문장에서 어문 규범에 부합하지 않는 부분을 찾아 고치고, 그 이유를 설명하세요.\n\"오늘은 퍼즐 마추기를 해 볼 거예요.\"",
+        "answer": "\"오늘은 퍼즐 맞추기를 해 볼 거예요.\"가 옳다. '제자리에 맞게 붙이다, 주문하다, 똑바르게 하다, 비교하다' 등의 뜻이 있는 말은 '마추다'가 아닌 '맞추다'로 적는다."
+    }
     prompt = ""
 
     for ex in examples:
         prompt += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
-    prompt += f"Question: {question}\nAnswer: {answer}"
+    prompt += f"Context: {context}\nQuestion: {question}\nAnswer: "
 
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    prompt_encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    answer_encoded = tokenizer(answer, return_tensors="pt", truncation=True, max_length=512).to(device)
 
-    with torch.no_grad():
-        outputs = model(**inputs, labels=inputs["input_ids"])
-    return torch.exp(outputs.loss).item()
+    prompt_ids = prompt_encoded["input_ids"][0]
+    answer_ids = answer_encoded["input_ids"][0]
 
-def compute_context_few_shot_ppl(context: str, question: str, answer: str, examples: list) -> float:
-    base_example = {
-        "question": '다음 문장에서 어문 규범에 부합하지 않는 부분을 찾아 고치고, 그 이유를 설명하세요.\n"오늘은 퍼즐 마추기를 해 볼 거예요."',
-        "answer": '"오늘은 퍼즐 맞추기를 해 볼 거예요."가 옳다. ...'
-    }
-    prompt = f"Question: {base_example['question']}\nAnswer: {base_example['answer']}\n\n"
+    input_ids = torch.cat([prompt_ids, answer_ids], dim=0).unsqueeze(0)
+    attention_mask = torch.ones_like(input_ids).to(device)
 
-    for ex in examples:
-        prompt += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
-    prompt += f"Context: {context}\nQuestion: {question}\nAnswer: {answer}"
-
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    labels = input_ids.clone()
+    labels[:, :prompt_ids.shape[0]] = -100
 
     with torch.no_grad():
-        outputs = model(**inputs, labels=inputs["input_ids"])
-    return torch.exp(outputs.loss).item()
+        outputs = model(
+            input_ids = input_ids, 
+            attention_mask = attention_mask, 
+            labels=labels
+        )
+        loss = outputs.loss
+
+    return torch.exp(loss).item()
 
 grammar_book = "/home/nlplab/hdd1/soeon/Korean_QA_RAG_2025/data/GrammarBook_structured.json"
 test_data = "/home/nlplab/hdd1/soeon/Korean_QA_RAG_2025/data/korean_language_rag_V1.0_dev.json"
@@ -141,17 +210,19 @@ for qa in tqdm(qas, desc="QAs"):
             for i, (rid, cat, title, ppl) in enumerate(perps[:top_k])
         ]
     })
-å
-with open("base_ppl.json", "w", encoding="utf-8") as f:
+
+os.makedirs("results", exist_ok=True)
+
+with open("./results/base_ppl.json", "w", encoding="utf-8") as f:
     json.dump(base_ppl_results, f, ensure_ascii=False, indent=4)
 
-with open("few_shot_ppl.json", "w", encoding="utf-8") as f:
+with open("./results/few_shot_ppl.json", "w", encoding="utf-8") as f:
     json.dump(few_shot_ppl_results, f, ensure_ascii=False, indent=4)
 
-with open("context_few_shot_ppl.json", "w", encoding="utf-8") as f:
+with open("./results/context_few_shot_ppl.json", "w", encoding="utf-8") as f:
     json.dump(context_few_shot_results, f, ensure_ascii=False, indent=4)
 
-with open("ppl_ranking.json", "w", encoding="utf-8") as f:
+with open("./results/ppl_ranking.json", "w", encoding="utf-8") as f:
     json.dump(ranking_results, f, ensure_ascii=False, indent=4)
 
 print("Results saved successfully!")
