@@ -7,7 +7,7 @@ from compute_perplexity import getPerplexity
 from compute_bleurt import getBLEURT
 # from compute_rouge1 import getROUGE1
 from context_Analyze import ContextAnalyze, PerplexityComputer, BERTScoreComputer, ROUGE1Computer, create_context_analyzer
-from data_loader import DataLoader
+from data import DataLoader
 from result_processor import ResultProcessor
 
 def main():
