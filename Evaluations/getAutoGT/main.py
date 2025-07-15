@@ -16,11 +16,11 @@ def main():
     print(">> Model loaded, now proceeding...", flush=True)
 
     compute_ppl = getPerplexity(model)
-    compute_bleurt = getBLEURT(model)
+    # compute_bleurt = getBLEURT(model)
     # compute_rouge1 = getROUGE1(model)
 
     context_analyze = ContextAnalyze(PerplexityComputer(compute_ppl))
-    context_analyze_bleurt = ContextAnalyze(BERTScoreComputer(compute_bleurt))
+    # context_analyze_bleurt = ContextAnalyze(BERTScoreComputer(compute_bleurt))
     # context_analyze_rouge1 = ContextAnalyze(ROUGE1Computer(compute_rouge1))
 
     data_loader = DataLoader()
@@ -30,7 +30,6 @@ def main():
     # Load rules, QAs, and few-shot examples
     rules = data_loader.get_rules()
     qas = data_loader.get_qas()
-    few_shot_examples = data_loader.get_few_shot_examples()
 
     result_processor = ResultProcessor()
 
@@ -40,13 +39,11 @@ def main():
         question = qa["input"]["question"]
         answer = qa["output"]["answer"]
 
-        lowest_ppl_contexts, highest_delta_contexts, baseline_ppl = context_analyze.find_best_context(
-            question, answer, rules, few_shot_examples, top_k=10
-        )
+        lowest_ppl_contexts, highest_delta_contexts, (baseline_ppl, _) = context_analyze.find_best_context(qa["input"]["question_type"], question, answer, rules, few_shot_examples, top_k=5)
 
-        lowest_bleurt_contexts, highest_delta_bleurt_contexts, baseline_bleurt = context_analyze_bleurt.find_best_context(
-            question, answer, rules, few_shot_examples, top_k=10
-        )
+        # lowest_bleurt_contexts, highest_delta_bleurt_contexts, baseline_bleurt = context_analyze_bleurt.find_best_context(
+        #     question, answer, rules, few_shot_examples, top_k=10
+        # )
         
         # lowest_rouge1_contexts, highest_delta_rouge1_contexts, baseline_rouge1 = context_analyze_rouge1.find_best_context(
         #     question, answer, rules, few_shot_examples, top_k=10
@@ -59,9 +56,9 @@ def main():
             baseline_ppl,
             lowest_ppl_contexts,
             highest_delta_contexts,
-            baseline_bleurt,
-            lowest_bleurt_contexts,
-            highest_delta_bleurt_contexts,
+            # baseline_bleurt,
+            # lowest_bleurt_contexts,
+            # highest_delta_bleurt_contexts,
             # baseline_rouge1,
             # lowest_rouge1_contexts,
             # highest_delta_rouge1_contexts
