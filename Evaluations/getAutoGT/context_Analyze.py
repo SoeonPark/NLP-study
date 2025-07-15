@@ -1,10 +1,12 @@
+# ./context_Analyze.py
+
 from abc import ABC, abstractmethod
 from tqdm import tqdm
 
 class MetricComputer(ABC):
     
     @abstractmethod
-    def compute_baseline(self, question: str, answer: str, examples: list):
+    def compute_baseline(self, question_type: str, question: str, answer: str):
         pass
     
     @abstractmethod
@@ -19,6 +21,21 @@ class MetricComputer(ABC):
     def is_higher_better(self) -> bool:
         pass
 
+class PerplexityComputer(MetricComputer):
+    def __init__(self, getPerplexity):
+        self.getPPL = getPerplexity
+
+    def compute_baseline(self, question_type: str, question: str, answer: str, examples: list[dict]):
+        return self.getPPL.compute_baseline_ppl(question_type, question, answer, examples)
+
+    def compute_context_score(self, question_type: str, context: str,question: str, answer: str, examples: list[dict]):
+        return self.getPPL.compute_context_ppl(question_type, context, question, answer, examples)
+
+    def get_metric_name(self) -> str:
+        return "ppl"
+
+    def is_higher_better(self) -> bool:
+        return False
 
 class BERTScoreComputer(MetricComputer):
     def __init__(self, getBLEURT):
@@ -35,23 +52,6 @@ class BERTScoreComputer(MetricComputer):
     
     def is_higher_better(self) -> bool:
         return True
-
-
-class PerplexityComputer(MetricComputer):
-    def __init__(self, getPerplexity):
-        self.getPPL = getPerplexity
-    
-    def compute_baseline(self, question: str, answer: str, examples: list):
-        return self.getPPL.compute_baseline_ppl(question, answer, examples)
-    
-    def compute_context_score(self, context: str, question: str, answer: str, examples: list):
-        return self.getPPL.compute_context_ppl(context, question, answer, examples)
-    
-    def get_metric_name(self) -> str:
-        return "ppl"
-    
-    def is_higher_better(self) -> bool:
-        return False  # 낮은 perplexity가 더 좋음
 
 
 class ROUGE1Computer(MetricComputer):
@@ -75,9 +75,16 @@ class ContextAnalyze:
     def __init__(self, metric_computer: MetricComputer):
         self.metric_computer = metric_computer
     
-    def find_best_context(self, question: str, answer: str, rules: list, examples: list, top_k: int = 5) -> tuple:
+    def find_best_context(self, question_type: str, question: str, answer: str, rules: list, top_k: int = 5) -> tuple:
 
-        baseline_score = self.metric_computer.compute_baseline(question, answer, examples)
+        context_ppl, context_gen = self.metric_computer.compute_context_score(question_type, r["description"], question, answer, examples)
+
+        if isinstance(self.metric_computer, PerplexityComputer):
+            baseline_ppl, baseline_gen = self.metric_computer.compute_baseline(question_type, question, answer, examples)
+        else:
+            baseline_ppl, _ = baseline_score
+            baseline_gen = None
+
         metric_name = self.metric_computer.get_metric_name()
         is_higher_better = self.metric_computer.is_higher_better()
         
@@ -85,11 +92,13 @@ class ContextAnalyze:
         
         print(f"Computing context {metric_name.upper()} scores...")
         for r in tqdm(rules):
-            context_score = self.metric_computer.compute_context_score(
-                r["description"], question, answer, examples
-            )
+            context_score = self.metric_computer.compute_context_score(question_type, r["description"], question, answer)
+            if isinstance(self.metric_computer, PerplexityComputer):
+                context_ppl, context_gen = context_out
+            else:
+                context_ppl, _ = context_out
+                context_gen = None
             
-            # 개선량 계산
             if is_higher_better:
                 delta_score = context_score - baseline_score
                 improvement_ratio = delta_score / baseline_score if baseline_score > 0 else 0
@@ -102,13 +111,13 @@ class ContextAnalyze:
                 "category": r["category"],
                 "title": r["title"],
                 "description": r["description"],
-                f"context_{metric_name}": context_score,
+                f"context_{metric_name}": context_ppl,
+                f"context_gen_{metric_name}": context_gen,
                 f"baseline_{metric_name}": baseline_score,
                 f"delta_{metric_name}": delta_score,
                 "improvement_ratio": improvement_ratio
             })
         
-        # 절대적 성능 기준으로 정렬
         if is_higher_better:
             context_results_by_absolute = sorted(context_results, key=lambda x: x[f"context_{metric_name}"], reverse=True)
         else:
