@@ -3,18 +3,16 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
-model_id = "meta-llama/Llama-2-7b-chat-hf" #"skt/kogpt2-base-v2"
+model_id = "kakaocorp/kanana-1.5-8b-instruct-2505" #"meta-llama/Llama-2-13b-chat-hf" #"skt/kogpt2-base-v2"
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
-grammar_book = "/home/nlplab/hdd1/soeon/Korean_QA_RAG_2025/data/GrammarBook_structured.json"
-test_data = "/home/nlplab/hdd1/soeon/Korean_QA_RAG_2025/data/korean_language_rag_V1.0_dev.json"
-few_shot_path = "/home/nlplab/hdd1/soeon/Korean_QA_RAG_2025/data/korean_language_rag_V1.0_train.json"
+grammar_book = ""
+test_data = ""
 result_dir = "./results"
 
 MAX_PROMPT = 1024
 MAX_CONTEXT = 512
-top_k = 10
-few_shot_examples = 2
+top_k = 5
 
 class KOGPT2:
     def __init__(self):
@@ -45,8 +43,6 @@ class Llama2_7b:
             device_map="auto",
             resume_download=True,
             use_auth_token=True,
-
-            # use_safetensors = False
         )
         self.model.eval()
 
