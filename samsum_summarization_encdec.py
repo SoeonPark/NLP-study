@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -347,7 +347,7 @@ class CustomT5ForSummarization(nn.Module):
         position_offset = 0 
         if past_key_values is not None and past_key_values[0] is not None:
             # past_key_values[0] corresponds to the self-attention layer's past keys
-            position_offset = past_key_values[0][0].size(1)  # Length of cached keys
+            position_offset = past_key_values[0][0][0].size(2)  # Length of cached keys
 
         x = x + self.pos_embedding[:, position_offset:position_offset + target_seq_len, :].to(device)
         x = self.dropout(x)
@@ -481,7 +481,7 @@ def prepare_summarization_data(examples: Dict[str, List[str]], tokenizer: AutoTo
 
     # Prepare Decoder Inputs (Shift Right with BOS Token)
     decoder_input_ids = torch.zeros_like(labels["input_ids"])
-    decoder_input_ids[:, 0] = tokenizer.cls_token_id  # BOS token
+    decoder_input_ids[:, 0] = tokenizer.pad_token_id  # BOS token
     decoder_input_ids[:, 1:] = labels["input_ids"][:, :-1] # Shift right
 
     model_inputs["decoder_input_ids"] = decoder_input_ids
@@ -507,17 +507,17 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
             summary, max_length = 64, padding = True, truncation = True, return_tensors = "pt"
         )   
 
-    # Prepare Decoder Inputs (Shifted Right with BOS Token)
-    labels = target_encodings["input_ids"]
-    decoder_input_ids = torch.full_like(labels, tokenizer.pad_token_id)
-    decoder_input_ids[:, 0] = tokenizer.pad_token_id  # BOS token
-    # decoder_input_ids[:, 1:] = target_encodings["input_ids"][:, :-1] # Shift right
-    if labels.size(1) > 1:
-        decoder_input_ids[:, 1:] = labels[:, :-1]  # Shift right
+    # # Prepare Decoder Inputs (Shifted Right with BOS Token)
+    # labels = target_encodings["input_ids"]
+    # decoder_input_ids = torch.full_like(labels, tokenizer.pad_token_id)
+    # decoder_input_ids[:, 0] = tokenizer.pad_token_id  # BOS token
+    # # decoder_input_ids[:, 1:] = target_encodings["input_ids"][:, :-1] # Shift right
+    # if labels.size(1) > 1:
+    #     decoder_input_ids[:, 1:] = labels[:, :-1]  # Shift right
 
-    # T5의 BOS는 <pad> 토큰 ID (ID 0)입니다.
-    # decoder_input_ids[:, 0]는 이미 pad_token_id로 채워져 있으므로 명시적인 할당이 필요 없습니다.
-
+    target_ids = target_encodings["input_ids"]
+    decoder_input_ids = torch.full_like(target_ids, tokenizer.pad_token_id)
+    decoder_input_ids[:, 1:] = target_ids[:, :-1]
 
     return {
         "input_ids": source_encodings["input_ids"],
@@ -546,15 +546,17 @@ def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer: torch.optim
                 print(f"    >> {key}: {value.shape}")
             print("="*80)
 
-            decoded_input = tokenizer.decode(batch["decoder_input_ids"][0], skip_special_tokens = False)
-            input_mask = batch["decoder_attention_mask"][0].tolist()
-            print(f"    >> Sample Decoder Input IDs: {batch['decoder_input_ids'][0].tolist()}")
+            decoded_input = tokenizer.decode(batch["input_ids"][0], skip_special_tokens = False)
+            input_mask = batch["attention_mask"][0].tolist()
             print(f"    >> Sample Decoded Source (Input) Text: {decoded_input}")
             print(f"    >> Sample Decoder Attention Mask: {input_mask[:20]}... (Total Length: {len(input_mask)})")
 
-            decoded_label = tokenizer.decode(batch["labels"][0].tolist(), skip_special_tokens = False)
+            decoded_label = tokenizer.decode(batch["labels"][0].tolist(), skip_special_tokens = True)
+            print(f"\n    >> Sample Decoded Target (Label, GT Summary) Text: {decoded_label}")
+
+            decoded_dec_input = tokenizer.decode(batch["decoder_input_ids"][0].tolist(), skip_special_tokens = False)
             dec_mask = batch["decoder_attention_mask"][0].tolist()
-            print(f"    >> Sample Decoded Decoder Input (Shifted Right) Text: {decoded_label}")
+            print(f"    >> Sample Decoded Decoder Input (Shifted Right) Text: {decoded_dec_input}")
             print(f"    >> Sample Decoder Attention Mask: {dec_mask[:20]}... (Total Length: {len(dec_mask)})")
             print("="*80)
 
@@ -733,7 +735,7 @@ print(f"    >> Epochs: 2")
 print("="*80)
 
 # Training Loop
-num_epochs = 2
+num_epochs = 10
 for epoch in range(num_epochs):
     print(f"\nEpoch {epoch+1}/{num_epochs}")
     print("-" * 80)
