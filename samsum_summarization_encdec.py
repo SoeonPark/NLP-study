@@ -81,7 +81,9 @@ class CustomMultiHeadAttention(torch.nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.scale = 1 / math.sqrt(self.d_k)
 
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: Optional[torch.Tensor] = None, is_cross_attention: Optional[bool] = False) -> torch.Tensor:
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
+                mask: Optional[torch.Tensor] = None, 
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
         batch_size, seq_len_q = query.size(0), query.size(1)
         seq_len_k = key.size(1)
 
@@ -89,6 +91,13 @@ class CustomMultiHeadAttention(torch.nn.Module):
         Q = self.w_q(query) # (batch_size, query_len, d_model)
         K = self.w_k(key)   # (batch_size, key_len, d_model
         V = self.w_v(value) # (batch_size, value_len, d_model)
+
+        # If past_key_value is provided, concatenate with current K, V for faster decoding
+        if past_key_value is not None:
+            past_key, past_value = past_key_value
+            K = torch.cat([past_key, K], dim=1)  # Concatenate on sequence length
+            V = torch.cat([past_value, V], dim=1)
+            seq_len_k = K.size(1)  # Update key length
 
         # Reshape for multi-head attention: (batch_size, n_heads, seq_len, d_k)
         Q = Q.view(batch_size, seq_len_q, self.n_heads, self.d_k).transpose(1, 2)
@@ -131,12 +140,13 @@ class CustomMultiHeadAttention(torch.nn.Module):
         # Final linear layer
         output = self.w_o(context)  # (batch_size, query_len, d_model)
 
-        return output, attn_weights
+        present_key_value = (K, V)  # For caching in decoder during inference
+
+        return output, present_key_value
 
 class CustomFeedForward(torch.nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
-
         self.linear1 = CustomLinear(d_model, d_ff)
         self.linear2 = CustomLinear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
@@ -211,8 +221,8 @@ class TransformerDecoderLayer(torch.nn.Module):
         # 1. Causal Self-Attention with Residual
         self_attn_out, present_self_kv = self.self_attn(
             query = x,
-            key = x if past_self_kv is None else torch.cat([past_self_kv[0], x], dim=1), # Concatenate past key
-            value = x if past_self_kv is None else torch.cat([past_self_kv[1], x], dim=1), # Concatenate past value
+            key = x, 
+            value = x,
             mask = target_mask,
             past_key_values = past_self_kv,
         )
@@ -221,8 +231,8 @@ class TransformerDecoderLayer(torch.nn.Module):
         # 2. Cross-Attention with Encoder Outputs and Residual
         cross_attn_out, present_cross_kv = self.cross_attn(
             query = x,
-            key = enc_output if past_cross_kv is None else torch.cat([past_cross_kv[0], enc_output], dim=1),
-            value = enc_output if past_cross_kv is None else torch.cat([past_cross_kv[1], enc_output], dim=1),
+            key = enc_output,
+            value = enc_output,
             mask = source_mask,
             past_key_values = past_cross_kv,
         )
@@ -278,9 +288,9 @@ class CustomT5ForSummarization(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Set Special Tokens
-        self.pad_token_id = None
-        self.bos_token_id = None
-        self.eos_token_id = None
+        self.pad_token_id = tokenizer.pad_token_id 
+        self.bos_token_id = tokenizer.pad_token_id # T5 uses pad_token_id as BOS
+        self.eos_token_id = tokenizer.eos_token_id
 
         self._init_weights()
 
@@ -296,7 +306,7 @@ class CustomT5ForSummarization(nn.Module):
     
     def _init_weights(self):
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.output_projection.weight, mean=0.0, std=0.02)
 
     def create_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Create a causal mask for self-attention in the decoder"""
@@ -331,7 +341,10 @@ class CustomT5ForSummarization(nn.Module):
         x = self.embedding(decoder_input_ids) * math.sqrt(self.d_model)
 
         # Position Offset for Decoder when using past_key_values
-        position_offset = 0 if past_key_values is None else past_key_values[0][0][0].shape[1]
+        position_offset = 0 
+        if past_key_values is not None and past_key_values[0] is not None:
+            # past_key_values[0] corresponds to the self-attention layer's past keys
+            position_offset = past_key_values[0][0][0].size(1)  # Length of cached keys
 
         x = x + self.pos_embedding[:, position_offset:position_offset + target_seq_len, :].to(device)
         x = self.dropout(x)
@@ -364,13 +377,17 @@ class CustomT5ForSummarization(nn.Module):
         
         if decoder_input_ids is not None:
             # Decode
-            dec_output, _ = self.decode(
-                decoder_input_ids, enc_output, attention_mask
+            dec_output, present_key_values = self.decode(
+                decoder_input_ids, 
+                enc_output, 
+                attention_mask=attention_mask,
+                decoder_attention_mask=decoder_attention_mask,
+                past_key_values=past_key_values
             )
             
             # Get logits
-            logits = self.lm_head(dec_output)
-            
+            logits = self.output_projection(dec_output)
+
             # Compute loss if labels provided
             if labels is not None:
                 loss_fct = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
@@ -430,7 +447,7 @@ def prepare_summarization_data(examples: Dict[str, List[str]], tokenizer: AutoTo
     """
     # Tokenize Source Documents and Target Summaries
     source = examples["article"]
-    targets = examples["highlights"]
+    targets = examples["summary"]
 
     # Tokenize Source
     model_inputs = tokenizer(
@@ -458,16 +475,16 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     """
         Custom Collate Function with Dynamic Padding
     """
-    articles = [item["article"] for item in batch]
-    highlights = [item["highlights"] for item in batch]
+    dialogue = [item["dialogue"] for item in batch]
+    summary = [item["summary"] for item in batch]
 
     # Tokenize Source Documents (Source)
     source_encodings = tokenizer(
-        articles, max_length = 128, padding = True, truncation = True, return_tensors = "pt"
+        dialogue, max_length = 128, padding = True, truncation = True, return_tensors = "pt"
     )
     # Tokenize Target Summaries (Target)
     target_encodings = tokenizer(
-        highlights, max_length = 64, padding = True, truncation = True, return_tensors = "pt"
+        summary, max_length = 64, padding = True, truncation = True, return_tensors = "pt"
     )   
 
     # Prepare Decoder Inputs (Shifted Right with BOS Token)
@@ -497,13 +514,14 @@ def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer: torch.optim
         batch = {k: v.to(device) for k, v in batch.items()}
 
         # Forward Pass
-        loss = model(
-            input_ids = batch["input_ids"],
-            attention_mask = batch["attention_mask"],
-            decoder_input_ids = batch["decoder_input_ids"],
-            decoder_attention_mask = batch["decoder_attention_mask"],
-            labels = batch["labels"]
+        output = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            decoder_input_ids=batch["decoder_input_ids"],
+            decoder_attention_mask=batch["decoder_attention_mask"],
+            labels=batch["labels"]
         )
+        loss = output['loss']
 
         # Backward
         loss.backward()
@@ -549,12 +567,10 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: torch.devic
 
             # Generate Summaries for Evaluation
             generated_ids = model.generate(
-                input_ids = batch["input_ids"],
-                attention_mask = batch["attention_mask"],
-                max_length = 64,
-                num_beams = 4,
-                tokenizer = tokenizer,
-                device = device
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                max_length=64,
+                early_stopping=True
             )
 
             # Decode Generated and Reference Summaries
