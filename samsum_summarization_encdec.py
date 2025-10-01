@@ -1,6 +1,9 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+import warnings
+warnings.filterwarnings('ignore')
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -199,7 +202,7 @@ class TransformerDecoderLayer(torch.nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
 
         # Feed-Forward Network
-        self.ffn = CustomFeedForward(d_model, n_heads, d_ff, dropout)
+        self.ffn = CustomFeedForward(d_model, d_ff, dropout)
         self.norm3 = nn.LayerNorm(d_model)
 
         self.dropout = nn.Dropout(dropout)
@@ -224,7 +227,7 @@ class TransformerDecoderLayer(torch.nn.Module):
             key = x, 
             value = x,
             mask = target_mask,
-            past_key_values = past_self_kv,
+            past_key_value = past_self_kv,
         )
         x = self.norm1(x + self.dropout(self_attn_out))
 
@@ -234,7 +237,7 @@ class TransformerDecoderLayer(torch.nn.Module):
             key = enc_output,
             value = enc_output,
             mask = source_mask,
-            past_key_values = past_cross_kv,
+            past_key_value = past_cross_kv,
         )
         x = self.norm2(x + self.dropout(cross_attn_out))
 
@@ -261,7 +264,8 @@ class CustomT5ForSummarization(nn.Module):
     """
     def __init__(self, vocab_size: int, d_model: int = 512, n_heads: int = 8, 
                  n_encoder_layers: int = 6, n_decoder_layers: int = 6, 
-                 d_ff: int = 2048, max_length: int = 512, dropout: float = 0.1):
+                 d_ff: int = 2048, max_length: int = 512, dropout: float = 0.1,
+                 pad_token_id: int = None, bos_token_id: int = None, eos_token_id: int = None):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
@@ -288,9 +292,9 @@ class CustomT5ForSummarization(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Set Special Tokens
-        self.pad_token_id = tokenizer.pad_token_id 
-        self.bos_token_id = tokenizer.pad_token_id # T5 uses pad_token_id as BOS
-        self.eos_token_id = tokenizer.eos_token_id
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = pad_token_id  # T5 uses pad_token_id as BOS
+        self.eos_token_id = eos_token_id
 
         self._init_weights()
 
@@ -332,7 +336,7 @@ class CustomT5ForSummarization(nn.Module):
     def decode(self, decoder_input_ids: torch.Tensor, enc_output: torch.Tensor, 
                attention_mask: Optional[torch.Tensor] = None,
                decoder_attention_mask: Optional[torch.Tensor] = None,
-               past_key_values: Optional[List[Tuple[torch.Tensor]]] = None) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor]]]:
+               past_key_values = None) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor]]]:
         """Decode the target sequence with access to encoder outputs"""
         batch_size, target_seq_len = decoder_input_ids.size()
         device = decoder_input_ids.device
@@ -408,7 +412,7 @@ class CustomT5ForSummarization(nn.Module):
         enc_output = self.encode(input_ids, attention_mask)
 
         # Start with BOS token
-        decoder_input_ids = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device)
+        decoder_input_ids = torch.full((batch_size, 1), self.bos_token_id, dtype=torch.long, device=device) 
 
         past_key_values = None
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -420,7 +424,7 @@ class CustomT5ForSummarization(nn.Module):
                     decoder_input_ids[:, -1:], # Only the last token
                     enc_output,
                     attention_mask,
-                    past_key_values=past_key_values
+                    past_key_value=past_key_values
                 )
 
                 # Get logits for the last token
@@ -438,7 +442,7 @@ class CustomT5ForSummarization(nn.Module):
                 if early_stopping and finished.all():
                     break
 
-        return decoder_input_ids[:, 1:]  # Remove the initial BOS token from the
+        return decoder_input_ids[:, 1:]  # Remove the initial BOS token from the output
 
 def prepare_summarization_data(examples: Dict[str, List[str]], tokenizer: AutoTokenizer, max_input_length: int = 512, max_target_length: int = 128) -> Dict[str, Any]:
     """
@@ -489,7 +493,7 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
     # Prepare Decoder Inputs (Shifted Right with BOS Token)
     decoder_input_ids = torch.zeros_like(target_encodings["input_ids"])
-    decoder_input_ids[:, 0] = tokenizer.cls_token_id  # BOS token
+    decoder_input_ids[:, 0] = tokenizer.pad_token_id  # BOS token
     decoder_input_ids[:, 1:] = target_encodings["input_ids"][:, :-1] # Shift right
 
     return {
@@ -521,7 +525,7 @@ def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer: torch.optim
             decoder_attention_mask=batch["decoder_attention_mask"],
             labels=batch["labels"]
         )
-        loss = output['loss']
+        loss = output[0]  # Get loss
 
         # Backward
         loss.backward()
@@ -556,13 +560,14 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, device: torch.devic
             batch = {k: v.to(device) for k, v in batch.items()}
 
             # Compute Loss
-            loss = model(
-                input_ids = batch["input_ids"],
-                attention_mask = batch["attention_mask"],
-                decoder_input_ids = batch["decoder_input_ids"],
-                decoder_attention_mask = batch["decoder_attention_mask"],
-                labels = batch["labels"]
+            output = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                decoder_input_ids=batch["decoder_input_ids"],
+                decoder_attention_mask=batch["decoder_attention_mask"],
+                labels=batch["labels"]
             )
+            loss = output[0]  # Get loss
             total_loss += loss.item()
 
             # Generate Summaries for Evaluation
@@ -622,4 +627,95 @@ model = CustomT5ForSummarization(
     max_length=512
 )
 
-# Set Special Tokens
+model.pad_token_id = tokenizer.pad_token_id
+model.bos_token_id = tokenizer.cls_token_id  # T5 uses pad_token_id as BOS
+model.eos_token_id = tokenizer.eos_token_id
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# print(f"\n >> Model Architecture:")
+# print(f"    >> Device: {device}")
+# print(f"    >> Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+# print(f"    >> Encoder parameters: {sum(p.numel() for p in model.encoder_layers.parameters()):,}")
+# print(f"    >> Decoder parameters: {sum(p.numel() for p in model.decoder_layers.parameters()):,}")
+
+print(f"\n >> Model Architecture:")
+print(f"Device: {device}")
+print("="*80)
+
+# 1. Shared Components
+embedding_params = sum(p.numel() for p in model.embedding.parameters())
+output_proj_params = sum(p.numel() for p in model.output_projection.parameters())
+
+# 2. Encoder-only
+encoder_params = sum(p.numel() for p in model.encoder_layers.parameters())
+
+# 3. Decoder-only
+decoder_params = sum(p.numel() for p in model.decoder_layers.parameters())
+
+# 4. Total
+total_params = sum(p.numel() for p in model.parameters())
+
+print(f" >> Parameter Breakdown:")
+print(f"     ├─ Shared Embedding:        {embedding_params:>12,} ({embedding_params/total_params*100:>5.2f}%)")
+print(f"     ├─ Output Projection:       {output_proj_params:>12,} ({output_proj_params/total_params*100:>5.2f}%)")
+print(f"     ├─ Encoder Layers:          {encoder_params:>12,} ({encoder_params/total_params*100:>5.2f}%)")
+print(f"     ├─ Decoder Layers:          {decoder_params:>12,} ({decoder_params/total_params*100:>5.2f}%)")
+print(f"     └─ Total:                   {total_params:>12,}")
+
+print(f"\n >> Comparison with Standard Models:")
+print(f"     ├─ Your Custom Model:       {total_params:>12,}")
+print(f"     ├─ T5-Small (official):     {60_506_624:>12,}  (60M)")
+print(f"     ├─ T5-Base:                 {222_903_552:>12,}  (223M)")
+print(f"     └─ BART-Base:               {139_420_416:>12,}  (139M)")
+print("="*80)
+
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"    >> Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+
+train_data = dataset['train'].shuffle(seed=42).select(range(2000))
+eval_data = dataset['validation'].shuffle(seed=42).select(range(200))
+
+train_loader = DataLoader(train_data, batch_size=8, collate_fn=custom_collate_fn, shuffle=True)
+eval_loader = DataLoader(eval_data, batch_size=8, collate_fn=custom_collate_fn)
+
+optimizer = AdamW(model.parameters(), lr=5e-4)
+
+print("\n >> Starting Training...")
+print(f"    >> Batch size: 8")
+print(f"    >> Learning rate: 5e-4")
+print(f"    >> Epochs: 2")
+print("="*80)
+
+# Training Loop
+num_epochs = 2
+for epoch in range(num_epochs):
+    print(f"\nEpoch {epoch+1}/{num_epochs}")
+    print("-" * 80)
+    
+    # Training
+    train_loss = train_epoch(model, train_loader, optimizer, device)
+    print(f" >> Epoch {epoch+1} - Avg Train Loss: {train_loss:.4f}")
+    
+    # Evaluation
+    rouge_scores, eval_loss, gen_summaries, ref_summaries = evaluate_model(
+        model, eval_loader, device, tokenizer
+    )
+    
+    print(f"\n >> Evaluation Results:")
+    print(f"    >> Eval Loss: {eval_loss:.4f}")
+    print(f"    >> ROUGE-1: {rouge_scores['rouge1']:.4f}")
+    print(f"    >> ROUGE-2: {rouge_scores['rouge2']:.4f}")
+    print(f"    >> ROUGE-L: {rouge_scores['rougeL']:.4f}")
+    print("="*80)
+
+print("\n✨ Training Completed!")
+
+print("\n >> Sample Generated Summaries:")
+for i in range(min(3, len(gen_summaries))):
+    print(f"\n--- Example {i+1} ---")
+    print(f"Generated: {gen_summaries[i]}")
+    print(f"Reference: {ref_summaries[i]}")
+    print("-"*60)
