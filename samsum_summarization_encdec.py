@@ -95,17 +95,17 @@ class CustomMultiHeadAttention(torch.nn.Module):
         K = self.w_k(key)   # (batch_size, key_len, d_model
         V = self.w_v(value) # (batch_size, value_len, d_model)
 
+        # Reshape for multi-head attention: (batch_size, n_heads, seq_len, d_k)
+        Q = Q.view(batch_size, seq_len_q, self.n_heads, self.d_k).transpose(1, 2)
+        K = K.view(batch_size, seq_len_k, self.n_heads, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, seq_len_k, self.n_heads, self.d_k).transpose(1, 2)
+
         # If past_key_value is provided, concatenate with current K, V for faster decoding
         if past_key_value is not None:
             past_key, past_value = past_key_value
             K = torch.cat([past_key, K], dim=1)  # Concatenate on sequence length
             V = torch.cat([past_value, V], dim=1)
             seq_len_k = K.size(1)  # Update key length
-
-        # Reshape for multi-head attention: (batch_size, n_heads, seq_len, d_k)
-        Q = Q.view(batch_size, seq_len_q, self.n_heads, self.d_k).transpose(1, 2)
-        K = K.view(batch_size, seq_len_k, self.n_heads, self.d_k).transpose(1, 2)
-        V = V.view(batch_size, seq_len_k, self.n_heads, self.d_k).transpose(1, 2)
 
         # Scaled Dot-Product Attention
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
@@ -207,7 +207,8 @@ class TransformerDecoderLayer(torch.nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, enc_output: torch.Tensor, target_mask: Optional[torch.Tensor] = None, source_mask: Optional[torch.Tensor] = None, past_key_values: Optional[List[Tuple[torch.Tensor]]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, enc_output: torch.Tensor, target_mask: Optional[torch.Tensor] = None, 
+                source_mask: Optional[torch.Tensor] = None, past_key_values: Optional[List[Tuple[torch.Tensor]]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
             Args:
                 x: (batch_size, tgt_seq_len, d_model) - Decoder input embeddings
@@ -217,27 +218,21 @@ class TransformerDecoderLayer(torch.nn.Module):
                 past_key_values: Cached key and value tensors for faster decoding (inference) -- (self_kv, cross_kv) 
         """
         # Unpack past if exists
-        # Since the shape of past_key_values is List[Tuple[Tensor, Tensor]] for each layer
-        past_self_kv = past_key_values[0] if past_key_values is not None else None
-        past_cross_kv = past_key_values[1] if past_key_values is not None else None
+        past_self_kv = past_key_values if past_key_values is not None else None
 
         # 1. Causal Self-Attention with Residual
         self_attn_out, present_self_kv = self.self_attn(
-            query = x,
-            key = x, 
-            value = x,
+            query = x, key = x, value = x,
             mask = target_mask,
-            past_key_value = past_self_kv,
+            past_key_value = past_self_kv
         )
         x = self.norm1(x + self.dropout(self_attn_out))
 
-        # 2. Cross-Attention with Encoder Outputs and Residual
-        cross_attn_out, present_cross_kv = self.cross_attn(
-            query = x,
-            key = enc_output,
-            value = enc_output,
+        # 2. Cross-Attention with Encoder Outputs and Residual (Without past_key_values)
+        cross_attn_out, _ = self.cross_attn(
+            query = x, key = enc_output, value = enc_output,
             mask = source_mask,
-            past_key_value = past_cross_kv,
+            past_key_value = None  # No caching for cross-attention
         )
         x = self.norm2(x + self.dropout(cross_attn_out))
 
@@ -245,10 +240,7 @@ class TransformerDecoderLayer(torch.nn.Module):
         ffn_out = self.ffn(x)
         x = self.norm3(x + self.dropout(ffn_out))
 
-        # Pack Present Key-Values
-        present_key_values = (present_self_kv, present_cross_kv)
-
-        return x, present_key_values
+        return x, present_self_kv
 
 class CustomT5ForSummarization(nn.Module):
     """
@@ -272,7 +264,9 @@ class CustomT5ForSummarization(nn.Module):
 
         # Shared Token Embeddings
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_embedding = self._create_positional_encoding(max_length, d_model)
+        # self.pos_embedding = self._create_positional_encoding(max_length, d_model)
+        pos_embedding = self._create_positional_encoding(max_length, d_model)
+        self.register_buffer("pos_embedding", pos_embedding)
 
         # Encoder (Bidirectional)
         self.encoder_layers = nn.ModuleList([
@@ -348,13 +342,24 @@ class CustomT5ForSummarization(nn.Module):
         position_offset = 0 
         if past_key_values is not None and past_key_values[0] is not None:
             # past_key_values[0] corresponds to the self-attention layer's past keys
-            position_offset = past_key_values[0][0][0].size(1)  # Length of cached keys
+            position_offset = past_key_values[0][0].size(1)  # Length of cached keys
 
         x = x + self.pos_embedding[:, position_offset:position_offset + target_seq_len, :].to(device)
         x = self.dropout(x)
 
-        # Create Causal Mask for Decoder Self-Attention
-        causal_mask = self.create_causal_mask(target_seq_len, device)
+        # Create Causal Mask for Decoder Self-Attention (With considering KV Caching)
+        # if past_key_values is not None and past_key_values[0] is not None:
+        #     # If uses past_key_values, only need to attend to the last token, which is the current token being processed
+        #     total_seq_len = position_offset + target_seq_len
+        #     causal_mask = self.create_causal_mask(total_seq_len, device)
+        #     causal_mask = causal_mask[-target_seq_len:, :] # (target_seq_len, total_seq_len)
+        # else:
+        #     causal_mask = self.create_causal_mask(target_seq_len, device)
+
+        total_kv_len = position_offset + target_seq_len
+        
+        causal_mask = self.create_causal_mask(total_kv_len, device)
+        causal_mask = causal_mask[position_offset:total_kv_len, :total_kv_len]
 
         # Decoder Layers
         present_key_values = []
@@ -419,12 +424,17 @@ class CustomT5ForSummarization(nn.Module):
 
         for step in range(max_length):
             with torch.no_grad():
+                if past_key_values is None:
+                    decoder_input = decoder_input_ids
+                else:
+                    decoder_input = decoder_input_ids[:, -1:]  # Only the last token for efficiency
+
                 # Decode step
                 dec_output, present_key_values = self.decode(
                     decoder_input_ids[:, -1:], # Only the last token
                     enc_output,
                     attention_mask,
-                    past_key_value=past_key_values
+                    past_key_values=past_key_values
                 )
 
                 # Get logits for the last token
@@ -492,9 +502,12 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     )   
 
     # Prepare Decoder Inputs (Shifted Right with BOS Token)
-    decoder_input_ids = torch.zeros_like(target_encodings["input_ids"])
+    labels = target_encodings["input_ids"]
+    decoder_input_ids = torch.full_like(labels, tokenizer.pad_token_id)
     decoder_input_ids[:, 0] = tokenizer.pad_token_id  # BOS token
-    decoder_input_ids[:, 1:] = target_encodings["input_ids"][:, :-1] # Shift right
+    # decoder_input_ids[:, 1:] = target_encodings["input_ids"][:, :-1] # Shift right
+    if labels.size(1) > 1:
+        decoder_input_ids[:, 1:] = labels[:, :-1]  # Shift right
 
     return {
         "input_ids": source_encodings["input_ids"],
@@ -624,11 +637,13 @@ model = CustomT5ForSummarization(
     n_encoder_layers=4,
     n_decoder_layers=4,
     d_ff=2048,
-    max_length=512
+    max_length=512,
+    pad_token_id=tokenizer.pad_token_id,
+    eos_token_id=tokenizer.eos_token_id
 )
 
 model.pad_token_id = tokenizer.pad_token_id
-model.bos_token_id = tokenizer.cls_token_id  # T5 uses pad_token_id as BOS
+model.bos_token_id = tokenizer.pad_token_id  # T5 uses pad_token_id as BOS
 model.eos_token_id = tokenizer.eos_token_id
 
 
