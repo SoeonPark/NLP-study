@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -103,9 +103,9 @@ class CustomMultiHeadAttention(torch.nn.Module):
         # If past_key_value is provided, concatenate with current K, V for faster decoding
         if past_key_value is not None:
             past_key, past_value = past_key_value
-            K = torch.cat([past_key, K], dim=1)  # Concatenate on sequence length
-            V = torch.cat([past_value, V], dim=1)
-            seq_len_k = K.size(1)  # Update key length
+            K = torch.cat([past_key, K], dim=2)  # Concatenate on sequence length
+            V = torch.cat([past_value, V], dim=2)
+            seq_len_k = K.size(2)  # Update key length
 
         # Scaled Dot-Product Attention
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
@@ -127,6 +127,11 @@ class CustomMultiHeadAttention(torch.nn.Module):
                 # 2. Padding Mask for Encoder-Decoder Attention: (batch_size, seq_len_k) => need to expand to (batch_size, 1, 1, seq_len_k)
                 elif mask.size(0) == batch_size and mask.size(1) == seq_len_k:
                     mask_to_apply = mask.unsqueeze(1).unsqueeze(2).expand(batch_size, self.n_heads, 1, seq_len_k)  # (batch_size, 1, 1, seq_len_k)
+                elif seq_len_q == 1:
+                    # If Q_len=1, create an all-ones mask allowing all past key tokens.
+                    mask_to_apply = torch.ones(batch_size, self.n_heads, 1, seq_len_k, device=scores.device)
+                else: # Exception case
+                    raise ValueError(f"Unhandled 2D mask size: {mask.size()} for Q_len={seq_len_q}, K_len={seq_len_k}, Batch={batch_size}")
 
             scores = scores.masked_fill(mask_to_apply == 0, -1e9)
 
@@ -497,9 +502,10 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         dialogue, max_length = 128, padding = True, truncation = True, return_tensors = "pt"
     )
     # Tokenize Target Summaries (Target)
-    target_encodings = tokenizer(
-        summary, max_length = 64, padding = True, truncation = True, return_tensors = "pt"
-    )   
+    with tokenizer.as_target_tokenizer(): 
+        target_encodings = tokenizer(
+            summary, max_length = 64, padding = True, truncation = True, return_tensors = "pt"
+        )   
 
     # Prepare Decoder Inputs (Shifted Right with BOS Token)
     labels = target_encodings["input_ids"]
@@ -508,6 +514,10 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     # decoder_input_ids[:, 1:] = target_encodings["input_ids"][:, :-1] # Shift right
     if labels.size(1) > 1:
         decoder_input_ids[:, 1:] = labels[:, :-1]  # Shift right
+
+    # T5의 BOS는 <pad> 토큰 ID (ID 0)입니다.
+    # decoder_input_ids[:, 0]는 이미 pad_token_id로 채워져 있으므로 명시적인 할당이 필요 없습니다.
+
 
     return {
         "input_ids": source_encodings["input_ids"],
@@ -521,7 +531,7 @@ def custom_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 #####################################################
  # Train and Evaluation Functions
 #####################################################
-def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device) -> float:
+def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer: torch.optim.Optimizer, device: torch.device, epoch: int, tokenizer: AutoTokenizer) -> float:
     """Train Function for One Epoch"""
     model.train()
     total_loss = 0.0
@@ -529,6 +539,24 @@ def train_epoch(model: nn.Module, dataloader: DataLoader, optimizer: torch.optim
     for step, batch in enumerate(dataloader):
         # Move batch to device
         batch = {k: v.to(device) for k, v in batch.items()}
+
+        if epoch == 0 and step == 0:
+            print(f"\n >> Sample Batch Shapes:")
+            for key, value in batch.items():
+                print(f"    >> {key}: {value.shape}")
+            print("="*80)
+
+            decoded_input = tokenizer.decode(batch["decoder_input_ids"][0], skip_special_tokens = False)
+            input_mask = batch["decoder_attention_mask"][0].tolist()
+            print(f"    >> Sample Decoder Input IDs: {batch['decoder_input_ids'][0].tolist()}")
+            print(f"    >> Sample Decoded Source (Input) Text: {decoded_input}")
+            print(f"    >> Sample Decoder Attention Mask: {input_mask[:20]}... (Total Length: {len(input_mask)})")
+
+            decoded_label = tokenizer.decode(batch["labels"][0].tolist(), skip_special_tokens = False)
+            dec_mask = batch["decoder_attention_mask"][0].tolist()
+            print(f"    >> Sample Decoded Decoder Input (Shifted Right) Text: {decoded_label}")
+            print(f"    >> Sample Decoder Attention Mask: {dec_mask[:20]}... (Total Length: {len(dec_mask)})")
+            print("="*80)
 
         # Forward Pass
         output = model(
@@ -711,7 +739,7 @@ for epoch in range(num_epochs):
     print("-" * 80)
     
     # Training
-    train_loss = train_epoch(model, train_loader, optimizer, device)
+    train_loss = train_epoch(model, train_loader, optimizer, device, epoch, tokenizer)
     print(f" >> Epoch {epoch+1} - Avg Train Loss: {train_loss:.4f}")
     
     # Evaluation
@@ -726,7 +754,7 @@ for epoch in range(num_epochs):
     print(f"    >> ROUGE-L: {rouge_scores['rougeL']:.4f}")
     print("="*80)
 
-print("\n✨ Training Completed!")
+print("\n >> Training Completed! <<")
 
 print("\n >> Sample Generated Summaries:")
 for i in range(min(3, len(gen_summaries))):
