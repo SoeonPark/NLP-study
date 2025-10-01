@@ -7,7 +7,7 @@ warnings.filterwarnings('ignore')
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, GPT2Model, T5ForConditionalGeneration
+from transformers import AutoTokenizer, GPT2Model, T5ForConditionalGeneration, AutoModelForCausalLM
 from datasets import load_dataset
 from typing import Optional, Tuple, List, Dict, Any
 from torch.utils.data import DataLoader
@@ -44,6 +44,18 @@ import numpy as np
             * Decoder: Generates output tokens one at a time with unidirectional attention and cross-attention to the encoder's outputs.
 
     ============================================================
+
+    Flow of the Code:
+        1. Transformer Components from Scratch
+            - Implement Custom Modules by hand (Linear, Feed-Forward, Multi-Head Attention, Positional Encoding)
+            - Attention Mechanism: With the class, CustomMultiHeadAttention, implemented from scaling, masking, dropout, to output projection. Even KV caching is implemented.
+            - Layers:
+                * Encoder: TransformerEncoderLayer with Bidirectional Self-Attention
+                * Decoder: TransformerDecoderLayer with Masked Self-Attention, Cross-Attention, Feed-Forward -> Unidirectional
+
+        2. Generation Logic with KV Caching & Positional Encoding
+            - KV Caching: Implemented in the CustomMultiHeadAttention and TransformerDecoderLayer
+            - Positional Encoding Offset: When using KV Caching, the positional offset is considered.
 
 """
 class CustomLinear(torch.nn.Module):
@@ -660,21 +672,23 @@ print(f"Sample Summary: {sample['summary']}")
 
 # Initialize Model and Tokenizer
 tokenizer = AutoTokenizer.from_pretrained("t5-small")
-model = CustomT5ForSummarization(
-    vocab_size=tokenizer.vocab_size,
-    d_model=512,
-    n_heads=8,
-    n_encoder_layers=4,
-    n_decoder_layers=4,
-    d_ff=2048,
-    max_length=512,
-    pad_token_id=tokenizer.pad_token_id,
-    eos_token_id=tokenizer.eos_token_id
-)
+# model = CustomT5ForSummarization(
+#     vocab_size=tokenizer.vocab_size,
+#     d_model=512,
+#     n_heads=8,
+#     n_encoder_layers=4,
+#     n_decoder_layers=4,
+#     d_ff=2048,
+#     max_length=512,
+#     pad_token_id=tokenizer.pad_token_id,
+#     eos_token_id=tokenizer.eos_token_id
+# )
 
-model.pad_token_id = tokenizer.pad_token_id
-model.bos_token_id = tokenizer.pad_token_id  # T5 uses pad_token_id as BOS
-model.eos_token_id = tokenizer.eos_token_id
+# model.pad_token_id = tokenizer.pad_token_id
+# model.bos_token_id = tokenizer.pad_token_id  # T5 uses pad_token_id as BOS
+# model.eos_token_id = tokenizer.eos_token_id
+
+model = T5ForConditionalGeneration.from_pretrained("t5-small")
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -691,34 +705,34 @@ print(f"Device: {device}")
 print("="*80)
 
 # 1. Shared Components
-embedding_params = sum(p.numel() for p in model.embedding.parameters())
-output_proj_params = sum(p.numel() for p in model.output_projection.parameters())
+# embedding_params = sum(p.numel() for p in model.embedding.parameters())
+# output_proj_params = sum(p.numel() for p in model.output_projection.parameters())
 
-# 2. Encoder-only
-encoder_params = sum(p.numel() for p in model.encoder_layers.parameters())
+# # 2. Encoder-only
+# encoder_params = sum(p.numel() for p in model.encoder_layers.parameters())
 
-# 3. Decoder-only
-decoder_params = sum(p.numel() for p in model.decoder_layers.parameters())
+# # 3. Decoder-only
+# decoder_params = sum(p.numel() for p in model.decoder_layers.parameters())
 
-# 4. Total
-total_params = sum(p.numel() for p in model.parameters())
+# # 4. Total
+# total_params = sum(p.numel() for p in model.parameters())
 
-print(f" >> Parameter Breakdown:")
-print(f"     ├─ Shared Embedding:        {embedding_params:>12,} ({embedding_params/total_params*100:>5.2f}%)")
-print(f"     ├─ Output Projection:       {output_proj_params:>12,} ({output_proj_params/total_params*100:>5.2f}%)")
-print(f"     ├─ Encoder Layers:          {encoder_params:>12,} ({encoder_params/total_params*100:>5.2f}%)")
-print(f"     ├─ Decoder Layers:          {decoder_params:>12,} ({decoder_params/total_params*100:>5.2f}%)")
-print(f"     └─ Total:                   {total_params:>12,}")
+# print(f" >> Parameter Breakdown:")
+# print(f"     ├─ Shared Embedding:        {embedding_params:>12,} ({embedding_params/total_params*100:>5.2f}%)")
+# print(f"     ├─ Output Projection:       {output_proj_params:>12,} ({output_proj_params/total_params*100:>5.2f}%)")
+# print(f"     ├─ Encoder Layers:          {encoder_params:>12,} ({encoder_params/total_params*100:>5.2f}%)")
+# print(f"     ├─ Decoder Layers:          {decoder_params:>12,} ({decoder_params/total_params*100:>5.2f}%)")
+# print(f"     └─ Total:                   {total_params:>12,}")
 
-print(f"\n >> Comparison with Standard Models:")
-print(f"     ├─ Your Custom Model:       {total_params:>12,}")
-print(f"     ├─ T5-Small (official):     {60_506_624:>12,}  (60M)")
-print(f"     ├─ T5-Base:                 {222_903_552:>12,}  (223M)")
-print(f"     └─ BART-Base:               {139_420_416:>12,}  (139M)")
-print("="*80)
+# print(f"\n >> Comparison with Standard Models:")
+# print(f"     ├─ Your Custom Model:       {total_params:>12,}")
+# print(f"     ├─ T5-Small (official):     {60_506_624:>12,}")
+# print(f"     ├─ T5-Base:                 {222_903_552:>12,}")
+# print(f"     └─ BART-Base:               {139_420_416:>12,}")
+# print("="*80)
 
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"    >> Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+# trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+# print(f"    >> Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
 
 train_data = dataset['train'].shuffle(seed=42).select(range(2000))
 eval_data = dataset['validation'].shuffle(seed=42).select(range(200))
@@ -726,16 +740,17 @@ eval_data = dataset['validation'].shuffle(seed=42).select(range(200))
 train_loader = DataLoader(train_data, batch_size=8, collate_fn=custom_collate_fn, shuffle=True)
 eval_loader = DataLoader(eval_data, batch_size=8, collate_fn=custom_collate_fn)
 
-optimizer = AdamW(model.parameters(), lr=5e-4)
-
-print("\n >> Starting Training...")
-print(f"    >> Batch size: 8")
-print(f"    >> Learning rate: 5e-4")
-print(f"    >> Epochs: 2")
-print("="*80)
+optimizer = AdamW(model.parameters(), lr=2e-4)
 
 # Training Loop
-num_epochs = 10
+num_epochs = 100
+
+print("\n >> Starting Training...")
+print(f"    >> Batch size: {train_loader.batch_size}")
+print(f"    >> Learning rate: {optimizer.defaults['lr']}")
+print(f"    >> Epochs: {num_epochs}")
+print("="*80)
+
 for epoch in range(num_epochs):
     print(f"\nEpoch {epoch+1}/{num_epochs}")
     print("-" * 80)
