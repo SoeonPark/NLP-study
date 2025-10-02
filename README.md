@@ -1,1 +1,2 @@
-Notes by a Student who started to study NLP
+A Strong Foundation is ESSENTIALLLLL;
+without it, everything will eventually collapse.
