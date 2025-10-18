@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -52,7 +52,8 @@ class GRPOSampler:
 
     def generate_group_samples(self, input_ids: torch.Tensor,
                                attention_mask: torch.Tensor,
-                               max_length: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+                               max_new_tokens: int = 64) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Going to use Llama model
         """
             Generate K size of Group Samples for each input in the batch.
 
@@ -64,24 +65,26 @@ class GRPOSampler:
             Returns:
                 - generated_ids: (batch_size, group_size, target_seq_len)
                 - log_probs: (batch_size, group_size, target_seq_len) -- log probabilities of each generated token
+
+            ====
+            >> The reason why use max_new_tokens, not max_length <<
         """
         self.model.eval()
         batch_size = input_ids.size(0)
         device = input_ids.device
 
         all_generated_ids = []
-        all_log_probs = []
 
         # Generate K size of samples
         for k in range(self.group_size):
             # Since it's just a sampling generation, don't need to compute for gradients
             with torch.no_grad():
                 # Use model's generate method with sampling
-                generated_ids = self.model.generate(
+                generated_outputs = self.model.generate(
                     input_ids = input_ids,
                     attention_mask = attention_mask,
                     do_sample = True,
-                    max_length = max_length,
+                    max_new_tokens = max_new_tokens,
                     temperature = self.temperature,
                     top_k = self.top_k,
                     top_p = self.top_p,
@@ -90,55 +93,84 @@ class GRPOSampler:
                     return_dict_in_generate = False
                     # Note: return_dict_in_generate=False to get only generated_ids
                 )
+                """
+                    return_dict_in_generate:
+                        - If True, returns a 'GenerateOutput(dict-like Object)' containing more information, such as logits, scores, attentions, etc.
+                        - If False, return Tensor or tuple, with only generated_ids(simple token ID sequences).
 
-            all_generated_ids.append(generated_ids)
+                    ```
+                        >>> outputs = model.generate(
+                        ...     input_ids,
+                        ...     max_length=10,
+                        ...     do_sample=False,
+                        ...     return_dict_in_generate=False
+                        ... )
+                            The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+                            Setting `pad_token_id` to `eos_token_id`:50256 for open-end generation.
+                        >>> print(type(outputs))
+                            <class 'torch.Tensor'>
+                        >>> print(outputs)
+                            tensor([[15496,    11,   616,  1438,   318,  1757,    13,   314,  1101,   257]])
+                        >>> print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+                            Hello, my name is John. I'm a
+
+                        >>> outputs = model.generate(
+                        ...     input_ids,
+                        ...     max_length=10,
+                        ...     do_sample=False,
+                        ...     return_dict_in_generate=True,
+                        ...     output_scores=True
+                        ... )
+                            The attention mask and the pad token id were not set. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+                            Setting `pad_token_id` to `eos_token_id`:50256 for open-end generation.
+                        >>> print(type(outputs))
+                            <class 'transformers.generation.utils.GenerateDecoderOnlyOutput'>
+                        >>> print(outputs.keys())
+                            dict_keys(['sequences', 'scores', 'past_key_values'])
+                        >>> print(outputs.sequences)
+                            tensor([[15496,    11,   616,  1438,   318,  1757,    13,   314,  1101,   257]])
+                        >>> print(outputs.scores[0].shape)
+                            torch.Size([1, 50257])
+                    ```
+                """
+                # generated_outputs: (batch_size, target_seq_len)
+
+            all_generated_ids.append(generated_outputs)
 
         # Stack generated ids: (batch_size, group_size, target_seq_len)
         generated_ids = torch.stack(all_generated_ids, dim=1) # dim=1 for group_size
 
-        # Compute log probabilities for each generated sequence
-        log_probs = self._compute_log_probs(input_ids, attention_mask, generated_ids)
+        # Compute log probabilities for each generated sequence -- for generated part only
+        log_probs = self._compute_log_probs(generated_ids, input_ids.size(1)) # (batch_size, group_size, target_seq_len)
 
         return generated_ids, log_probs
-    
-    def _compute_log_probs(self, input_ids: torch.Tensor,
-                           attention_mask: torch.Tensor,
-                           generated_ids: torch.Tensor) -> torch.Tensor:
+
+    def _compute_log_probs(self, generated_ids: torch.Tensor,
+                           input_length: int) -> torch.Tensor:
         """
-            Compue Log Probabilities of generated sequences, Manually.
+            Compute Log Probabilities of generated sequences, Manually.
 
             Args:
                 - input_ids: (batch_size, seq_len)
                 - attention_mask: (batch_size, seq_len)
-                - generated_ids: (batch_size, group_size, target_seq_len)
+                - generated_ids: (batch_size, group_size, total_seq_len)
 
             Returns:
-                - log_probs: (batch_size, group_size, target_seq_len)
+                - log_probs: (batch_size, group_size, generated_seq_len)
         """
-        batch_size, group_size, target_seq_len = generated_ids.size() # Extract sizes
+        batch_size, group_size, total_seq_len = generated_ids.size() # Extract sizes
         device = generated_ids.device
 
-        # Prepare Decoder Inputs(shifted right) - (batch_size, group_size, target_seq_len); for teacher forcing
-        decoder_input_ids = torch.full_like(generated_ids, self.tokenizer.pad_token_id)
-        decoder_input_ids[:, :, 1:] = generated_ids[:, :, :-1] # for each the last token, shift right
+        all_log_probs = []
 
-        all_log_probs = [] 
-
-        # Process each group sample
+        # Process each sample in group
         for k in range(group_size):
-            """
-                curr_decoder_inputs: Indexed decoder inputs for k-th sample in group
-                curr_labels: Indexed labels for k-th sample in group
-            """
-            curr_decoder_inputs = decoder_input_ids[:, k, :] # (batch_size, target_seq_len)
-            curr_labels = generated_ids[:, k, :] # (batch_size, target_seq_len)
+            curr_seq = generated_ids[:, k, :] # (batch_size, total_seq_len)
 
             with torch.no_grad():
                 outputs = self.model(
-                    input_ids = input_ids,
-                    attention_mask = attention_mask,
-                    decoder_input_ids = curr_decoder_inputs,
-                    labels = curr_labels
+                    input_ids = curr_seq,
+                    labels = curr_seq
                 )
             logits = outputs.logits # (batch_size, target_seq_len, vocab_size)
 
@@ -146,10 +178,10 @@ class GRPOSampler:
             log_probs_dist = F.log_softmax(logits, dim=-1) # (batch_size, target_seq_len, vocab_size)
 
             # Gather Log Probabilities of generated tokens
-            curr_log_probs = torch.gather(
+            token_log_probs = torch.gather(
                 log_probs_dist,
                 dim = 2, # vocab dimension
-                index = curr_labels.unsqueeze(-1) # (batch_size, target_seq_len, 1)
+                index = curr_seq.unsqueeze(-1) # (batch_size, target_seq_len, 1)
             ).squeeze(-1) # (batch_size, target_seq_len)
             """
                 >> Why unsqueeze and squeeze? <<
@@ -159,7 +191,11 @@ class GRPOSampler:
                     To extract elements from logits based on generated token ids, create an extra dimension with unsqueeze(index),
                     then remove it after gathering with squeeze().
             """
-            all_log_probs.append(curr_log_probs)
+
+            # Extract log probabilities for generated tokens only
+            # Shift by 1 because logits at position t corresponds to token at position t+1
+            generated_log_probs = token_log_probs[:, input_length - 1: -1] # (batch_size, generated_seq_len)
+            all_log_probs.append(generated_log_probs)
 
         # Stack Log Probabilities: (batch_size, group_size, target_seq_len)
         log_probs = torch.stack(all_log_probs, dim=1) # dim=1 for group_size
@@ -336,28 +372,9 @@ class GRPOLossCalculator:
         policy_gradient_loss = -(advantages * sequence_log_probs).mean() # Mean over batch and group
 
         return policy_gradient_loss
-    
-    def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        """
-            Compute Group-Relative Advantages within each group.
-            Advantage = reward - baseline (mean reward of the group)
-
-            Args:
-                - rewards: (batch_size, group_size) tensor of rewards
-
-            Returns:
-                - advantages: (batch_size, group_size) tensor of advantages
-        """
-        # Compute mean reward for each group
-        baseline = rewards.mean(dim=1, keepdim=True) # (batch_size, 1)
-
-        # Compute advantages
-        advantages = rewards - baseline # Broadcasting subtraction
-
-        return advantages
 
 # 4. Main Training Script Structure (Training Loop)
-def train_grpo(model: nn.Module, dataloader: DataLoader, 
+def train_grpo_llama(model: nn.Module, dataloader: DataLoader, 
                optimizer: torch.optim.Optimizer, device: torch.device,
                tokenizer: AutoTokenizer, epoch: int = 3,
                group_size: int = 5, temperature: float = 1.0,
@@ -383,41 +400,42 @@ def train_grpo(model: nn.Module, dataloader: DataLoader,
     for step, batch in enumerate(dataloader):
         # Load on device
         breakpoint()
+
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
+        reference_summaries = batch['summaries']  # List of strings
 
         if epoch == 0 and step == 0:
             print(" [DBG] Input IDs Shape:", input_ids.shape)
             print(" [DBG] Attention Mask Shape:", attention_mask.shape)
-            print(" [DBG] Labels Shape:", labels.shape)
+            print(" [DBG] Reference Summaries Shape:", reference_summaries.shape)
             print(" [DBG] Group Size:", group_size)
             print("============================================")
 
         # 1. Generate group samples (K Samples per input)
-        generate_ids, log_probs = sampler.generate_group_samples(
+        generated_ids, log_probs = sampler.generate_group_samples(
             input_ids = input_ids,
             attention_mask = attention_mask,
-            max_length = 128
-        ) # generate_ids: (batch_size, group_size, target_seq_len); log_probs: (batch_size, group_size, target_seq_len)
-        batch_size, group_size, target_seq_len = generate_ids.size()
+            max_new_tokens = 128
+        ) 
+        # generated_ids: (batch_size, group_size, total_seq_len)
+        # log_probs: (batch_size, group_size, generated_seq_len)
+        batch_size, group_size, total_seq_len = generated_ids.size()
+        generated_seq_len = total_seq_len - input_ids.size(1)
 
         # 2. Compute ROUGE rewards for each generated sample
         generated_texts = []
         for batch in range(batch_size):
             for k in range(group_size):
-                generated_text = tokenizer.decode(generate_ids[batch, k], skip_special_tokens=True)
+                # Extract only the generated tokens (After input length)
+                generated_tokens = generated_ids[batch, k, input_ids.size(1):] # (generated_seq_len)
+                generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
                 generated_texts.append(generated_text)
-
-        reference_texts = []
-        for batch in range(batch_size):
-            reference_text = tokenizer.decode(labels[batch], skip_special_tokens=True)
-            reference_texts.append(reference_text)
 
         # 3. Compute Rewards
         rewards = reward_calculator.compute_rewards(
             generated_summaries = generated_texts,
-            reference_summaries = reference_texts,
+            reference_summaries = reference_summaries,
             group_size = group_size
         ).to(device) # (batch_size, group_size)
 
@@ -426,7 +444,8 @@ def train_grpo(model: nn.Module, dataloader: DataLoader,
 
         # 5. Compute GRPO Loss
         # Firstly, Create attention mask for generated sequences
-        attention_mask_for_generation = (generate_ids != tokenizer.pad_token_id).float() # (batch_size, group_size, target_seq_len)
+        attention_mask_for_generation = (generated_ids[:, :, input_ids.size(1):] != tokenizer.pad_token_id).float()
+
         loss = loss_calculator.compute_loss(
             log_probs = log_probs,
             advantages = advantages,
@@ -474,34 +493,32 @@ def evaluate_grpo(model: nn.Module, dataloader: DataLoader,
         for step, batch in enumerate(dataloader):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+            reference_summaries = batch['summaries']  # List of strings
 
             # 1. Generate group samples
-            generate_ids, _ = sampler.generate_group_samples(
+            generated_ids, _ = sampler.generate_group_samples(
                 input_ids = input_ids,
                 attention_mask = attention_mask,
-                max_length = 128
-            ) # (batch_size, group_size, target_seq_len)
-            batch_size, group_size, target_seq_len = generate_ids.size()
+                max_new_tokens = 64
+            ) # (batch_size, group_size, total_seq_len)
+            batch_size, group_size, total_seq_len = generated_ids.size()
 
-            # 2. Compute ROUGE rewards
+            # 2. Decode Generated Parts only
             generated_texts = []
             for batch in range(batch_size):
                 for k in range(group_size):
-                    generated_text = tokenizer.decode(generate_ids[batch, k], skip_special_tokens=True)
+                    generated_tokens = generated_ids[batch, k, input_ids.size(1):] # (generated_seq_len)
+                    generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
                     generated_texts.append(generated_text)
-
-            reference_texts = []
-            for batch in range(batch_size):
-                reference_text = tokenizer.decode(labels[batch], skip_special_tokens=True)
-                reference_texts.append(reference_text)
 
             # 3. Compute Rewards
             rewards = reward_calculator.compute_rewards(
                 generated_summaries = generated_texts,
-                reference_summaries = reference_texts,
+                reference_summaries = reference_summaries,
                 group_size = group_size
             )
+
+            all_rewards.append(rewards)
             
             # Save the First Batch Samples for Inspection
             if step == 0:
@@ -509,7 +526,7 @@ def evaluate_grpo(model: nn.Module, dataloader: DataLoader,
                 sample_outputs.append({
                     'input': input_text,
                     'generated': [generated_texts[k] for k in range(group_size)],
-                    'reference': reference_texts[0],
+                    'reference': reference_summaries[0],
                     'rewards': rewards[0].tolist()
                 })
     
@@ -530,47 +547,49 @@ def evaluate_grpo(model: nn.Module, dataloader: DataLoader,
 # 6. Data Collection and Preparation
 def custom_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Dict[str, torch.Tensor]:
     """
-        Custom Collate Function to prepare batch data for GRPO training/evaluation.
+        Custom Collate Function to prepare batch data for GRPO training/evaluation with applying chat template for instruction.
 
         Args:
             - batch: List of data samples from the dataset
 
     """
-    dialogues = [item['dialogue'] for item in batch]
-    summaries = [item['summary'] for item in batch]
+    dialogues = [item['dialogue'] for item in batch] 
+    summaries = [item['summary'] for item in batch] # Ground Truth Summaries (Targets)
+
+    message_list = []
+    for dialogue in dialogues:
+        # Define the system instruction and user message
+        messages = [
+            {"role": "system", "content": "You are an expert summarizer. Summarize the following dialogue concisely."},
+            {"role": "user", "content": dialogue}
+            # Note: The expected *assistant* response (the summary) is added later if fine-tuning
+            # For pure input preparation (as in the original Llama function):
+        ]
+        message_list.append(messages)
+
+    # Format Inputs of model with 'apply_chat_template'
+    formatted_inputs = [
+        tokenizer.apply_chat_template(
+            conversation = messages,
+            tokenize = False, # Return string, not tokenized tensor
+            add_generation_prompt = True # Add assistant prompt for generation
+        ) for messages in message_list
+    ]
 
     # Tokenize inputs (dialogues)
     inputs = tokenizer(
-        dialogues,
+        formatted_inputs,
         max_length = 512,
         padding = True,
         truncation = True,
         return_tensors = 'pt'
     )
 
-    # Tokenize targets (summaries)
-    with tokenizer.as_target_tokenizer():
-        targets = tokenizer(
-            summaries,
-            max_length = 128,
-            padding = True,
-            truncation = True,
-            return_tensors = 'pt'
-        )
-
-    target_ids = targets["input_ids"]
-    decoder_input_ids = torch.full_like(target_ids, tokenizer.pad_token_id)
-    decoder_input_ids[:, 1:] = target_ids[:, :-1] # Shift right
-
-    batch_data = {
-        'input_ids': inputs.input_ids,
-        'attention_mask': inputs.attention_mask,
-        'labels': targets.input_ids,
-        'decoder_attention_mask': targets.attention_mask,
-        'decoder_input_ids': decoder_input_ids
+    return {
+        "input_ids": inputs.input_ids,
+        "attention_mask": inputs.attention_mask,
+        "summaries": summaries # Still keep as strings for evaluation, reward calculation
     }
-
-    return batch_data
     
 # 7. Main Execution
 def main():
@@ -589,9 +608,32 @@ def main():
 
     # Initionalize Tokenizer and Model
     print(" >> Initializing Tokenizer and Model...")
-    model_name = "meta-llama/Llama-3.2-1B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model_name = "meta-llama/Llama-3.2-1B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype = torch.float16,
+        device_map = "auto"
+    )
+
+    # Set pad token and Ensure for other tokens if not exist
+    print(" >> Setting up Tokenizer Special Tokens...")
+    print(f"   - Special Tokens Map: {tokenizer.special_tokens_map}")
+    if tokenizer.pad_token is None:
+        print("    - Setting PAD token as EOS token...")
+        tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.eos_token_id
+    print(f"   - PAD Token ID: {tokenizer.pad_token_id}")
+    print(f"   - EOS Token ID: {tokenizer.eos_token_id}")
+    print(f"   - BOS Token ID: {tokenizer.bos_token_id}")
+    """
+        Debug Remark:
+            - PAD Token ID: 128009
+            - EOS Token ID: 128009
+            - BOS Token ID: 128000
+
+        -> PAD token is set to EOS token as default.
+    """
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -620,9 +662,11 @@ def main():
     print("    - Number of Epochs:", num_epochs)
 
     # Prepare GRPO data
-    train_loader = DataLoader(dataset['train'], batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(dataset['validation'], batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(dataset['test'], batch_size=batch_size, shuffle=False)
+    train_data = dataset['train'].shuffle(seed=42)
+    val_data = dataset['validation'].shuffle(seed=42)
+
+    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, collate_fn=lambda x: custom_collate_fn(x, tokenizer))
+    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, collate_fn=lambda x: custom_collate_fn(x, tokenizer))
 
     # Initialize Optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
@@ -632,7 +676,7 @@ def main():
     for epoch in range(num_epochs):
         print(f" >> Epoch {epoch+1}/{num_epochs}")
         
-        train_loss, avg_reward = train_grpo(
+        train_loss, avg_reward = train_grpo_llama(
             model = model,
             tokenizer=tokenizer,
             dataloader = train_loader,
@@ -651,7 +695,7 @@ def main():
         print(" >> Starting GRPO Evaluation on Test Set...")
         eval_results = evaluate_grpo(
             model = model,
-            dataloader = test_loader,
+            dataloader = val_loader,
             device = device,
             group_size = group_size
         )
