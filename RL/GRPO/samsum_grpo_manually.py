@@ -82,12 +82,12 @@ class GRPOSampler:
 
         """
 
-        model_to_use = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-
         all_generated_ids = []
         max_length = 0 # Initialize max_length for generated sequences -> we use dynamically
 
         # breakpoint()
+
+        model_to_use = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
         # Generate K size of samples
         for k in range(self.group_size):
@@ -370,6 +370,7 @@ class GRPOSampler:
                 (Pdb) total_seq_len
                 531
         """
+        model_to_use = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
         all_log_probs = []
 
@@ -380,7 +381,7 @@ class GRPOSampler:
         
             curr_seq = generated_ids[:, k, :] # (batch_size, total_seq_len)
 
-            outputs = self.model(
+            outputs = model_to_use(
                     input_ids = curr_seq,
                     labels = curr_seq
                 )
@@ -628,8 +629,8 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
         # Load on device
         # breakpoint()
 
-        input_ids = batch['input_ids'].to("cuda:0")
-        attention_mask = batch['attention_mask'].to("cuda:0")
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
         reference_summaries = batch['summaries']  # List of strings
 
         if epoch == 0 and step == 0:
@@ -855,6 +856,7 @@ def main():
     # Set pad token and Ensure for other tokens if not exist
     print(" >> Setting up Tokenizer Special Tokens...")
     print(f"   - Special Tokens Map: {tokenizer.special_tokens_map}")
+
     if tokenizer.pad_token is None:
         print("    - Setting PAD token as EOS token...")
         tokenizer.pad_token = tokenizer.eos_token
@@ -871,15 +873,10 @@ def main():
         -> PAD token is set to EOS token as default.
     """
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to("cuda:0")
 
-    # Data-Parallel if multiple GPUs are available
-    if torch.cuda.device_count() > 1:
-        print(f" >> Multiple GPUs detected ({torch.cuda.device_count()}), using DataParallel...")
-        model = nn.DataParallel(model, device_ids = list(range(torch.cuda.device_count())))
-
-    print(f" >> Using Device: {device}")
+    print(f" >> Using Device: cuda:0")
     print(f" >> Total Parameters: {sum(p.numel() for p in model.parameters())}")
 
     # GRPO Hyperparameters
@@ -922,7 +919,7 @@ def main():
             tokenizer=tokenizer,
             dataloader = train_loader,
             optimizer = optimizer,
-            device = device,
+            device = "cuda:0",
             group_size = group_size,
             temperature = temperature,
             # top_k = top_k,
@@ -937,7 +934,7 @@ def main():
         eval_results = evaluate_grpo(
             model = model,
             dataloader = val_loader,
-            device = device,
+            device = "cuda:0",
             group_size = group_size
         )
         print(f" >> Epoch {epoch+1} Evaluation Results:")
