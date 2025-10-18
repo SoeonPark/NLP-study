@@ -7,7 +7,7 @@ warnings.filterwarnings("ignore")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, T5ForConditionalGeneration
+from transformers import AutoModelForCausalLM, AutoTokenizer, T5ForConditionalGeneration, get_linear_schedule_with_warmup
 from datasets import load_dataset
 from typing import List, Optional, Tuple, Dict, Any
 from torch.utils.data import DataLoader
@@ -15,6 +15,7 @@ from torch.optim import AdamW
 import evaluate
 import math
 import numpy as np
+from tqdm import tqdm
 
 """
     This script is for implementing the GRPO (Group Reward Policy Optimization) method
@@ -37,6 +38,161 @@ import numpy as np
         6. Evaluation Loop
         7. Execution
 """
+
+# ========================================================================
+# Supervised Fine-Tuning (SFT) Section for Policy Function Initialization
+# ========================================================================
+
+def sft_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Dict[str, torch.Tensor]:
+    """
+        Collate function for Supervised Fine-Tuning (SFT).
+        Pads input and target sequences to the maximum length in the batch.
+
+        Args:
+            - batch: List of samples from the dataset
+            - tokenizer: Tokenizer for padding
+
+        Returns:
+            - collated_batch: Dictionary containing padded input_ids, attention_mask, labels
+    """
+    dialogues = [item['dialogue'] for item in batch]
+    summaries = [item['summary'] for item in batch]
+
+    # Format with chat_template
+    formatted_texts = []
+    for dialogue, summary in zip(dialogues, summaries):
+        messages = [
+            {"role": "system", "content": "You are an expert summarizer. Summarize the following dialogue concisely."},
+            {"role": "user", "content": dialogue},
+            {"role": "assistant", "content": summary}
+        ]
+        text = tokenizer.apply_chat_template(
+            conversation = messages,
+            tokenize = False,
+            add_generation_prompt = False
+        )
+        formatted_texts.append(text)
+
+    # Tokenize inputs
+    encodings = tokenizer(
+        formatted_texts,
+        max_length = 512,
+        padding = True,
+        truncation = True,
+        return_tensors = 'pt'
+    )
+
+    # Labels are the same as input_ids for causal LM
+    labels = encodings.input_ids.clone()
+    labels[labels == tokenizer.pad_token_id] = -100 # Ignore padding tokens in loss computation
+
+    return {
+        'input_ids': encodings.input_ids,
+        'attention_mask': encodings.attention_mask,
+        'labels': labels
+    }
+
+def train_sft(model: nn.Module, dataloader: DataLoader,
+              optimizer: torch.optim.Optimizer, scheduler: Any,
+              device: torch.device, epoch: int, num_epochs: int = 3) -> float:
+
+    """
+        Supervised Fine-Tuning (SFT) Training Loop.
+        This loop is for initializing the policy model before applying GRPO.
+    """
+    model.train()
+    total_loss = 0.0
+    progress_bar = tqdm(dataloader, desc=f"SFT Epoch {epoch+1}/{num_epochs}")
+
+    for step, batch in enumerate(progress_bar):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+
+        # Forward pass
+        outputs = model(
+            input_ids = input_ids,
+            attention_mask = attention_mask,
+            labels = labels
+        )
+        loss = outputs.loss
+
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item()
+        progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        if (step + 1) % 100 == 0:
+            avg_loss = total_loss / (step + 1)
+            print(f"Step [{step+1}/{len(dataloader)}] | Average Loss: {avg_loss:.4f} | Loss: {loss.item():.4f}")
+
+    avg_epoch_loss = total_loss / len(dataloader)
+    return avg_epoch_loss
+
+def evaluate_sft(model: nn.Module, dataloader: DataLoader,
+                device: torch.device, tokenizer: AutoTokenizer) -> Dict[str, float]:
+    model.eval()
+    rouge = evaluate.load('rouge')
+
+    all_predictions = []
+    all_references = []
+    sample_outputs = []
+
+    with torch.no_grad():
+        for step, batch in enumerate(tqdm(dataloader, desc="SFT Evaluation")):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+
+            # Generate summaries
+            model_to_use = model.module if isinstance(model, nn.DataParallel) else model
+            generated_ids = model_to_use.generate(
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                max_new_tokens = 64,
+                do_sample = False,
+                pad_token_id = tokenizer.pad_token_id,
+                eos_token_id = tokenizer.eos_token_id
+            )
+
+            # Decode generated summaries
+            generated_summaries = tokenizer.batch_decode(
+                generated_ids[:, input_ids.size(1):],
+                skip_special_tokens = True,
+            )
+
+            all_predictions.extend(generated_summaries)
+            all_references.extend(batch["summary"])
+
+            # Store sample outputs for analysis
+            if step == 0:
+                for i in range(min(3, len(generated_summaries))):
+                    sample_outputs.append({
+                        "generated": generated_summaries[i],
+                        "reference": batch["summary"][i]
+                    })
+
+    # Compute ROUGE scores
+    rouge_results = rouge.compute(
+        predictions = all_predictions,
+        references= all_references,
+        use_stemmer = True
+    )
+
+    return {
+        "rouge1": rouge_results["rouge1"],
+        "rouge2": rouge_results["rouge2"],
+        "rougeL": rouge_results["rougeL"],
+        "samples": sample_outputs
+    }
+
+# ========================================
+# Group Reward Policy Optimization (GRPO)
+# ========================================
 
 # 1. Group Sampling Module
 class GRPOSampler:
@@ -644,7 +800,7 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
         generated_ids, log_probs = sampler.generate_group_samples(
             input_ids = input_ids,
             attention_mask = attention_mask,
-            max_new_tokens = 128
+            max_new_tokens = 32
         ) 
 
         # breakpoint()
@@ -708,15 +864,26 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
             #         print(f"    - Generated Sample {k+1}: {generated_texts[k]} | Reward: {rewards[0, k].item():.4f}")
             #         print("========================================================================================")
 
-            first_input_tokens = input_ids[0]
-            first_input_text = tokenizer.decode(first_input_tokens, skip_special_tokens=True)
+            first_input_ids = input_ids[0]
+            first_attention_mask = attention_mask[0]
 
-            first_reference_summary = reference_summaries[0]
+            full_padded_input_text = tokenizer.decode(first_input_ids, skip_special_tokens=False)
+
+            # Extract the exact Index that 1 is started in attention mask (which represents for the padding end)
+            start_index = torch.where(first_attention_mask == 1)[0][0].item()
+            # Slicing the actual input tokens (without padding)
+            non_padded_input_tokens = first_input_ids[start_index:]
+            clean_input_text = tokenizer.decode(non_padded_input_tokens, skip_special_tokens=False)
+
+            first_input_text = tokenizer.decode(non_padded_input_tokens, skip_special_tokens=True)
 
             print(" >> Sample Generation:")
             print(f"    - Group Samples (K={group_size}):")
-            print(f"    - Input Dialogue: {first_input_text}")
-            print(f"    - Input Texts to Model (with prompts and special tokens): {tokenizer.decode(first_input_tokens, skip_special_tokens=False)}")
+            print(f"    - Input Tokens (Full, including PADDING - for verification):")
+            print(full_padded_input_text) 
+            print(f"\n    - Input Dialogue (Clean Prompt, Special Tokens Intact - for context):")
+            print(clean_input_text)
+            print(f"   - Reference Summary: {reference_summaries[0]}")
             for k in range(group_size):
                 # generated_texts List is flattened, so calculate the correct index
                 sample_index_in_flat_list = k 
@@ -752,7 +919,7 @@ def evaluate_grpo(model: nn.Module, dataloader: DataLoader,
             generated_ids, _ = sampler.generate_group_samples(
                 input_ids = input_ids,
                 attention_mask = attention_mask,
-                max_new_tokens = 64
+                max_new_tokens = 32
             ) # (batch_size, group_size, total_seq_len)
             batch_size, group_size, total_seq_len = generated_ids.size()
 
@@ -798,12 +965,14 @@ def evaluate_grpo(model: nn.Module, dataloader: DataLoader,
 
     
 # 6. Data Collection and Preparation
-def custom_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Dict[str, torch.Tensor]:
+def grpo_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Dict[str, torch.Tensor]:
     """
         Custom Collate Function to prepare batch data for GRPO training/evaluation with applying chat template for instruction.
 
         Args:
             - batch: List of data samples from the dataset
+
+        -> This is a Collate Function for GRPO Training/Evaluation. Only Input Preparation is done here.
 
     """
     dialogues = [item['dialogue'] for item in batch] 
@@ -835,7 +1004,8 @@ def custom_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> 
         max_length = 512,
         padding = True,
         truncation = True,
-        return_tensors = 'pt'
+        return_tensors = 'pt',
+        add_special_tokens = False
     )
 
     return {
@@ -895,40 +1065,115 @@ def main():
     print(f" >> Using Device: {device}")
     print(f" >> Total Parameters: {sum(p.numel() for p in model.parameters())}")
 
+    # SFT Hyperparameters
+    print(" >> Setting up SFT Components...")
+    sft_learning_rate = 2e-5
+    sft_batch_size = 4
+    sft_num_epochs = 3
+
+    print("    - Learning Rate:", sft_learning_rate)
+    print("    - Batch Size:", sft_batch_size)
+    print("    - Number of Epochs:", sft_num_epochs)
+
     # GRPO Hyperparameters
-    group_size = 5
-    temperature = 1.0
-    top_k = 50
-    top_p = 0.95
-    beta = 0.1
-    learning_rate = 5e-5
-    batch_size = 2
-    num_epochs = 3
-
     print(" >> Setting up GRPO Components...")
-    print("    - Group Size:", group_size)
-    print("    - Temperature:", temperature)
-    print("    - Top-K:", top_k)
-    print("    - Top-P:", top_p)
-    print("    - Beta:", beta)
-    print("    - Learning Rate:", learning_rate)
-    print("    - Batch Size:", batch_size)
-    print("    - Number of Epochs:", num_epochs)
+    grop_group_size = 5
+    grop_temperature = 0.7
+    grop_top_k = 50
+    grop_top_p = 0.95
+    grop_beta = 0.1
+    grop_learning_rate = 5e-5
+    grop_batch_size = 2
+    grop_num_epochs = 3
 
-    # Prepare GRPO data
+    print("    - Group Size:", grop_group_size)
+    print("    - Temperature:", grop_temperature)
+    print("    - Top-K:", grop_top_k)
+    print("    - Top-P:", grop_top_p)
+    print("    - Beta:", grop_beta)
+    print("    - Learning Rate:", grop_learning_rate)
+    print("    - Batch Size:", grop_batch_size)
+    print("    - Number of Epochs:", grop_num_epochs)
+
+    # Load Data for Training 
     train_data = dataset['train'].shuffle(seed=42)
     val_data = dataset['validation'].shuffle(seed=42)
 
-    train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, collate_fn=lambda x: custom_collate_fn(x, tokenizer))
-    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, collate_fn=lambda x: custom_collate_fn(x, tokenizer))
+    print("============================================")
+    print(" >> Starting SFT Training... <<")
+    print("============================================")
+
+    sft_train_loader = DataLoader(train_data, batch_size=sft_batch_size, shuffle=True, collate_fn=lambda x: sft_collate_fn(x, tokenizer))
+    sft_val_loader = DataLoader(val_data, batch_size=sft_batch_size, shuffle=False, collate_fn=lambda x: sft_collate_fn(x, tokenizer))
+
+    # SFT Optimizer & Scheduler
+    sft_optimizer = AdamW(model.parameters(), lr=sft_learning_rate)
+    total_steps = len(sft_train_loader) * sft_num_epochs
+    sft_scheduler = get_linear_schedule_with_warmup(
+        sft_optimizer,
+        num_warmup_steps = int(0.1 * total_steps),
+        num_training_steps = total_steps
+    )
+
+    best_sft_rouge = 0.0
+    for epoch in range(sft_num_epochs):
+        print(f" >> SFT Epoch {epoch+1}/{sft_num_epochs}")
+        
+        sft_train_loss = train_sft(
+            model = model,
+            dataloader = sft_train_loader,
+            optimizer = sft_optimizer,
+            scheduler = sft_scheduler,
+            device = device,
+            epoch = epoch,
+            num_epochs = sft_num_epochs
+        )
+        print(f" >> SFT Epoch {epoch+1} Training Loss: {sft_train_loss:.4f}")
+
+        # SFT Evaluation
+        print(" >> Starting SFT Evaluation on Validation Set...")
+        eval_results = evaluate_sft(
+            model = model,
+            dataloader = sft_val_loader,
+            device = device,
+            tokenizer = tokenizer
+        )
+
+        print(f"   - ROGUE-1: {eval_results['rouge1']:.4f}")
+        print(f"   - ROGUE-2: {eval_results['rouge2']:.4f}")
+        print(f"   - ROGUE-L: {eval_results['rougeL']:.4f}")
+
+        if eval_results["samples"]:
+            print("   - Sample Generation:")
+            for i, sample in enumerate(eval_results["samples"]):
+                print(f"      * Sample {i+1}:")
+                print("        - Input Dialogue:", sample["input_dialogue"])
+                print("        - Reference Summary:", sample["reference_summary"])
+                print("        - Generated Summary:", sample["generated_summary"])
+
+        # Save best SFT model
+        if eval_results['rouge1'] > best_sft_rouge:
+            best_sft_rouge = eval_results["rougeL"]
+            sft_model_save_path = "./sft_samsum_model"
+            if isinstance(model, nn.DataParallel):
+                torch.save(model.module.state_dict(), sft_model_save_path)
+            else:
+                torch.save(model.state_dict(), sft_model_save_path)
+            print(f" >> Best SFT Model saved to {sft_model_save_path}")
+        print("============================================")
+
+    train_loader = DataLoader(train_data, batch_size=grop_batch_size, shuffle=True, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
+    val_loader = DataLoader(val_data, batch_size=grop_batch_size, shuffle=False, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
 
     # Initialize Optimizer
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
+    optimizer = AdamW(model.parameters(), lr=grop_learning_rate)
 
     # Training Loop
-    print(" >> Starting GRPO Training...")
-    for epoch in range(num_epochs):
-        print(f" >> Epoch {epoch+1}/{num_epochs}")
+    print("============================================")
+    print(" >> Starting GRPO Training... <<")
+    print("============================================")
+    for epoch in range(grop_num_epochs):
+        print(f" >> Epoch {epoch+1}/{grop_num_epochs}")
         
         train_loss, avg_reward = train_grpo_llama(
             model = model,
@@ -936,11 +1181,11 @@ def main():
             dataloader = train_loader,
             optimizer = optimizer,
             device = device,
-            group_size = group_size,
-            temperature = temperature,
-            # top_k = top_k,
-            # top_p = top_p,
-            beta = beta
+            group_size = grop_group_size,
+            temperature = grop_temperature,
+            # top_k = grop_top_k,
+            # top_p = grop_top_p,
+            beta = grop_beta
         )
         print(f" >> Epoch {epoch+1} Training Result:")
         print(f"    - Training Loss: {train_loss:.4f}, Average Reward: {avg_reward:.4f}")
@@ -951,7 +1196,7 @@ def main():
             model = model,
             dataloader = val_loader,
             device = device,
-            group_size = group_size
+            group_size = grop_group_size
         )
         print(f" >> Epoch {epoch+1} Evaluation Results:")
         print(f"    - ROUGE-1: {eval_results['rouge1']:.4f}, ROUGE-L: {eval_results['rougeL']:.4f}")
