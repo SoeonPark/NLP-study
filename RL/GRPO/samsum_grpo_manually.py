@@ -849,7 +849,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype = torch.float16,
+        torch_dtype = torch.float32,
         device_map = "auto"
     )
 
@@ -873,10 +873,10 @@ def main():
         -> PAD token is set to EOS token as default.
     """
 
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to("cuda:0")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
-    print(f" >> Using Device: cuda:0")
+    print(f" >> Using Device: {device}")
     print(f" >> Total Parameters: {sum(p.numel() for p in model.parameters())}")
 
     # GRPO Hyperparameters
@@ -919,7 +919,7 @@ def main():
             tokenizer=tokenizer,
             dataloader = train_loader,
             optimizer = optimizer,
-            device = "cuda:0",
+            device = device,
             group_size = group_size,
             temperature = temperature,
             # top_k = top_k,
@@ -934,7 +934,7 @@ def main():
         eval_results = evaluate_grpo(
             model = model,
             dataloader = val_loader,
-            device = "cuda:0",
+            device = device,
             group_size = group_size
         )
         print(f" >> Epoch {epoch+1} Evaluation Results:")
