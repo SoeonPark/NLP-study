@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -72,15 +72,29 @@ class GRPOSampler:
         self.model.eval()
         batch_size = input_ids.size(0)
         device = input_ids.device
+        """
+            Debug Remark:
+                
+                (Pdb) input_ids.shape
+                torch.Size([10, 403])   
+                (Pdb) batch_size
+                10
+
+        """
+
+        model_to_use = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
         all_generated_ids = []
+        max_length = 0 # Initialize max_length for generated sequences -> we use dynamically
+
+        # breakpoint()
 
         # Generate K size of samples
         for k in range(self.group_size):
             # Since it's just a sampling generation, don't need to compute for gradients
             with torch.no_grad():
                 # Use model's generate method with sampling
-                generated_outputs = self.model.generate(
+                generated_outputs = model_to_use.generate(
                     input_ids = input_ids,
                     attention_mask = attention_mask,
                     do_sample = True,
@@ -93,6 +107,22 @@ class GRPOSampler:
                     return_dict_in_generate = False
                     # Note: return_dict_in_generate=False to get only generated_ids
                 )
+                # breakpoint()
+                """
+                    Debug Remark:
+                        (Pdb) generated_outputs
+                        tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                                [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                                [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                                ...,
+                                [128000, 128000, 128006,  ...,    627,     12,   8529],
+                                [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                                [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                            device='cuda:0')
+                        (Pdb) generated_outputs.shape
+                        torch.Size([10, 531])
+                """
+                #################################################################################
                 """
                     return_dict_in_generate:
                         - If True, returns a 'GenerateOutput(dict-like Object)' containing more information, such as logits, scores, attentions, etc.
@@ -133,15 +163,182 @@ class GRPOSampler:
                             torch.Size([1, 50257])
                     ```
                 """
-                # generated_outputs: (batch_size, target_seq_len)
-
+                # generated_outputs: (batch_size, generated_seq_lens)
             all_generated_ids.append(generated_outputs)
+            max_length = max(max_length, generated_outputs.size(1))
+
+        # breakpoint()
+        """
+            Debug Remark:
+                (Pdb) generated_outputs
+                tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ...,   1005,     13, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0')
+                (Pdb) generated_outputs.shape
+                torch.Size([10, 518])
+                (Pdb) max_length
+                531
+                (Pdb) generated_outputs.size(1)
+                518
+                (Pdb) all_generated_ids
+                [tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ...,    627,     12,   8529],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0'), tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ...,  13263,   9499,     13],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0'), tensor([[128009, 128009, 128009,  ...,  16986,     13, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ...,     13, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0'), tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ...,  38156,     13, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0'), tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ...,   1005,     13, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0')]
+                (Pdb) all_generated_ids.shape
+                *** AttributeError: 'list' object has no attribute 'shape'
+        """
+        
+        # Pad all sequences to max_length
+        padded_ids = []
+        for generate_idx in all_generated_ids:
+            if generate_idx.size(1) < max_length:
+                padding = torch.full(
+                    (batch_size, max_length - generate_idx.size(1)),
+                    self.tokenizer.pad_token_id,
+                    dtype=generate_idx.dtype,
+                    device=device
+                )
+                generate_idx = torch.cat([generate_idx, padding], dim=1) # Pad on the right
+            padded_ids.append(generate_idx)
+
+        # breakpoint()
+        # 구뜨 ㅎㅎㅎ 잘 넘어간거 확인함
+        """
+            Debug Remark:
+                (Pdb) padded_ids
+                [tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ...,    627,     12,   8529],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0'), tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ...,  13263,   9499,     13],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0'), tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0'), tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0'), tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0')]
+                (Pdb) max_length
+                531
+                (Pdb) pad_token_id
+                *** NameError: name 'pad_token_id' is not defined
+                (Pdb) self.tokenizer.pad_token_id
+                128009
+                (Pdb) padding
+                tensor([[128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009],
+                        [128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009],
+                        [128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009],
+                        [128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009],
+                        [128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009],
+                        [128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009],
+                        [128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009],
+                        [128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009],
+                        [128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009],
+                        [128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009, 128009,
+                        128009, 128009, 128009, 128009]], device='cuda:0')
+                (Pdb) generate_idx
+                tensor([[128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        ...,
+                        [128000, 128000, 128006,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009],
+                        [128009, 128009, 128009,  ..., 128009, 128009, 128009]],
+                    device='cuda:0')
+                (Pdb) len(generate_idx)
+                10
+        """
 
         # Stack generated ids: (batch_size, group_size, target_seq_len)
-        generated_ids = torch.stack(all_generated_ids, dim=1) # dim=1 for group_size
+        generated_ids = torch.stack(padded_ids, dim=1) # dim=1 for group_size
 
         # Compute log probabilities for each generated sequence -- for generated part only
         log_probs = self._compute_log_probs(generated_ids, input_ids.size(1)) # (batch_size, group_size, target_seq_len)
+
+        # breakpoint()
+        """
+            Debug Remark:
+                (Pdb) log_probs.shape
+                torch.Size([10, 5, 128])
+                (Pdb) generated_ids.shape
+                torch.Size([10, 5, 531])
+                (Pdb) padded_ids.shape
+                *** NameError: name 'padded_ids' is not defined
+
+                >> The reason why 'padded_ids' was set earlier, but not defined in this scope. <<
+
+        """
 
         return generated_ids, log_probs
 
@@ -161,14 +358,29 @@ class GRPOSampler:
         batch_size, group_size, total_seq_len = generated_ids.size() # Extract sizes
         device = generated_ids.device
 
+        # breakpoint()
+        """
+            Debug Remark:
+                (Pdb) generated_ids.shape
+                torch.Size([10, 5, 531])
+                (Pdb) batch_size
+                10
+                (Pdb) group_size
+                5
+                (Pdb) total_seq_len
+                531
+        """
+        
         all_log_probs = []
 
         # Process each sample in group
         for k in range(group_size):
+
+            # breakpoint()
+        
             curr_seq = generated_ids[:, k, :] # (batch_size, total_seq_len)
 
-            with torch.no_grad():
-                outputs = self.model(
+            outputs = self.model(
                     input_ids = curr_seq,
                     labels = curr_seq
                 )
@@ -197,6 +409,21 @@ class GRPOSampler:
             generated_log_probs = token_log_probs[:, input_length - 1: -1] # (batch_size, generated_seq_len)
             all_log_probs.append(generated_log_probs)
 
+            # breakpoint()
+            """
+                Debug Remark:
+                    (Pdb) logits.shape
+                    torch.Size([10, 606, 128256])
+                    (Pdb) curr_seq.shape
+                    torch.Size([10, 606])    
+                    (Pdb) generated_log_probs.shape
+                    torch.Size([10, 128])
+                    (Pdb) token_log_probs.shape
+                    torch.Size([10, 606])
+                    (Pdb) input_length
+                    478     
+            """
+        
         # Stack Log Probabilities: (batch_size, group_size, target_seq_len)
         log_probs = torch.stack(all_log_probs, dim=1) # dim=1 for group_size
 
@@ -399,10 +626,10 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
 
     for step, batch in enumerate(dataloader):
         # Load on device
-        breakpoint()
+        # breakpoint()
 
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
+        input_ids = batch['input_ids'].to("cuda:0")
+        attention_mask = batch['attention_mask'].to("cuda:0")
         reference_summaries = batch['summaries']  # List of strings
 
         if epoch == 0 and step == 0:
@@ -418,11 +645,16 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
             attention_mask = attention_mask,
             max_new_tokens = 128
         ) 
+
+        # breakpoint()
+        
         # generated_ids: (batch_size, group_size, total_seq_len)
         # log_probs: (batch_size, group_size, generated_seq_len)
         batch_size, group_size, total_seq_len = generated_ids.size()
         generated_seq_len = total_seq_len - input_ids.size(1)
 
+        # breakpoint()
+        
         # 2. Compute ROUGE rewards for each generated sample
         generated_texts = []
         for batch in range(batch_size):
@@ -432,6 +664,8 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
                 generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
                 generated_texts.append(generated_text)
 
+        # breakpoint()
+        
         # 3. Compute Rewards
         rewards = reward_calculator.compute_rewards(
             generated_summaries = generated_texts,
@@ -439,6 +673,8 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
             group_size = group_size
         ).to(device) # (batch_size, group_size)
 
+        # breakpoint()
+        
         # 4. Compute Advantages
         advantages = reward_calculator.compute_advantages(rewards) # (batch_size, group_size
 
@@ -635,8 +871,13 @@ def main():
         -> PAD token is set to EOS token as default.
     """
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model.to(device)
+
+    # Data-Parallel if multiple GPUs are available
+    if torch.cuda.device_count() > 1:
+        print(f" >> Multiple GPUs detected ({torch.cuda.device_count()}), using DataParallel...")
+        model = nn.DataParallel(model, device_ids = list(range(torch.cuda.device_count())))
 
     print(f" >> Using Device: {device}")
     print(f" >> Total Parameters: {sum(p.numel() for p in model.parameters())}")
@@ -648,7 +889,7 @@ def main():
     top_p = 0.95
     beta = 0.1
     learning_rate = 5e-5
-    batch_size = 10
+    batch_size = 2
     num_epochs = 3
 
     print(" >> Setting up GRPO Components...")
