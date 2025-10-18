@@ -698,15 +698,31 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
         total_loss += loss.item()
         total_reward += rewards.mean().item()
 
-        if (step + 1) % 30 == 0:
+        if (step + 1) % 5 == 0:
             print(f" >> Step [{step+1}/{len(dataloader)}], Loss: {loss.item():.4f}, Avg Reward: {rewards.mean().item():.4f}")
 
-            # Print Sample Generation
-            if step == 0:
-                print(" >> Sample Generation:")
-                for k in range(group_size):
-                    print(f"    - Generated Sample {k+1}: {generated_texts[k]} | Reward: {rewards[0, k].item():.4f}")
-                    print("========================================================================================")
+            # # Print Sample Generation
+            # if step == 0:
+            #     print(" >> Sample Generation:")
+            #     for k in range(group_size):
+            #         print(f"    - Generated Sample {k+1}: {generated_texts[k]} | Reward: {rewards[0, k].item():.4f}")
+            #         print("========================================================================================")
+
+            first_input_tokens = input_ids[0]
+            first_input_text = tokenizer.decode(first_input_tokens, skip_special_tokens=True)
+
+            first_reference_summary = reference_summaries[0]
+
+            print(" >> Sample Generation:")
+            print(f"    - Group Samples (K={group_size}):")
+            print(f"    - Input Dialogue: {first_input_text}")
+            print(f"    - Input Texts to Model (with prompts and special tokens): {tokenizer.decode(first_input_tokens, skip_special_tokens=False)}")
+            for k in range(group_size):
+                # generated_texts List is flattened, so calculate the correct index
+                sample_index_in_flat_list = k 
+                print(f"        -> Generated Sample {k+1}: {generated_texts[sample_index_in_flat_list]} | Reward: {rewards[0, k].item():.4f}")
+            print(" -------------------------------------------------------------------")
+
 
     avg_loss = total_loss / len(dataloader)
     avg_reward = total_reward / len(dataloader)
@@ -797,7 +813,7 @@ def custom_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> 
     for dialogue in dialogues:
         # Define the system instruction and user message
         messages = [
-            {"role": "system", "content": "You are an expert summarizer. Summarize the following dialogue concisely."},
+            {"role": "system", "content": "You are an expert summarizer. Summarize the following English dialogue concisely, in English."},
             {"role": "user", "content": dialogue}
             # Note: The expected *assistant* response (the summary) is added later if fine-tuning
             # For pure input preparation (as in the original Llama function):
@@ -874,7 +890,7 @@ def main():
     """
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    # model.to(device)
 
     print(f" >> Using Device: {device}")
     print(f" >> Total Parameters: {sum(p.numel() for p in model.parameters())}")
