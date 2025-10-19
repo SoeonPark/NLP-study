@@ -89,7 +89,8 @@ def sft_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Dic
     return {
         'input_ids': encodings.input_ids,
         'attention_mask': encodings.attention_mask,
-        'labels': labels
+        'labels': labels,
+        'summary': summaries 
     }
 
 def train_sft(model: nn.Module, dataloader: DataLoader,
@@ -147,6 +148,7 @@ def evaluate_sft(model: nn.Module, dataloader: DataLoader,
         for step, batch in enumerate(tqdm(dataloader, desc="SFT Evaluation")):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            summaries = batch["summary"]
 
             # Generate summaries
             model_to_use = model.module if isinstance(model, nn.DataParallel) else model
@@ -155,6 +157,7 @@ def evaluate_sft(model: nn.Module, dataloader: DataLoader,
                 attention_mask = attention_mask,
                 max_new_tokens = 64,
                 do_sample = False,
+                num_beams = 1,
                 pad_token_id = tokenizer.pad_token_id,
                 eos_token_id = tokenizer.eos_token_id
             )
@@ -166,14 +169,14 @@ def evaluate_sft(model: nn.Module, dataloader: DataLoader,
             )
 
             all_predictions.extend(generated_summaries)
-            all_references.extend(batch["summary"])
+            all_references.extend(summaries)
 
             # Store sample outputs for analysis
             if step == 0:
                 for i in range(min(3, len(generated_summaries))):
                     sample_outputs.append({
                         "generated": generated_summaries[i],
-                        "reference": batch["summary"][i]
+                        "reference": summaries[i]
                     })
 
     # Compute ROUGE scores
@@ -480,7 +483,11 @@ class GRPOSampler:
         generated_ids = torch.stack(padded_ids, dim=1) # dim=1 for group_size
 
         # Compute log probabilities for each generated sequence -- for generated part only
-        log_probs = self._compute_log_probs(generated_ids, input_ids.size(1)) # (batch_size, group_size, target_seq_len)
+        # log_probs = self._compute_log_probs(generated_ids, input_ids.size(1)) # (batch_size, group_size, target_seq_len)
+        log_probs, ref_log_probs = self._compute_log_probs(
+            generated_ids,
+            input_length = input_ids.size(1)
+        ) # (batch_size, group_size, target_seq_len), (batch_size, group_size, target_seq_len)
 
         # breakpoint()
         """
@@ -499,7 +506,7 @@ class GRPOSampler:
         return generated_ids, log_probs
 
     def _compute_log_probs(self, generated_ids: torch.Tensor,
-                           input_length: int) -> torch.Tensor:
+                           input_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
             Compute Log Probabilities of generated sequences, Manually.
 
@@ -527,8 +534,10 @@ class GRPOSampler:
                 531
         """
         model_to_use = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-        
+        ref_model_to_use = self.reference_model.module if isinstance(self.reference_model, nn.DataParallel) else self.reference_model
+
         all_log_probs = []
+        all_ref_log_probs = []
 
         # Process each sample in group
         for k in range(group_size):
@@ -537,18 +546,41 @@ class GRPOSampler:
         
             curr_seq = generated_ids[:, k, :] # (batch_size, total_seq_len)
 
-            outputs = model_to_use(
-                    input_ids = curr_seq,
-                    labels = curr_seq
+            # Remove Labels and Compute Logits
+            with torch.no_grad():
+                # Policy Model Logits
+                policy_outputs = model_to_use(
+                    input_ids = curr_seq
                 )
-            logits = outputs.logits # (batch_size, target_seq_len, vocab_size)
+                policy_logits = policy_outputs.logits # (batch_size, target_seq_len, vocab_size)
+
+                # Reference Model Logits
+                ref_outputs = ref_model_to_use(
+                    input_ids = curr_seq
+                )
+                ref_logits = ref_outputs.logits # (batch_size, target_seq_len, vocab_size
+
+            policy_logits = policy_outputs.float()
+            ref_logits = ref_outputs.float()
+
+            # outputs = model_to_use(
+            #         input_ids = curr_seq,
+            #         labels = curr_seq
+            #     )
+            # logits = outputs.logits # (batch_size, target_seq_len, vocab_size)
 
             # Compute log probabilities
-            log_probs_dist = F.log_softmax(logits, dim=-1) # (batch_size, target_seq_len, vocab_size)
+            policy_log_probs = F.log_softmax(policy_logits, dim=-1) # (batch_size, target_seq_len, vocab_size)
+            ref_log_probs = F.log_softmax(ref_logits, dim=-1) # (batch_size, target_seq_len, vocab_size)
 
             # Gather Log Probabilities of generated tokens
             token_log_probs = torch.gather(
-                log_probs_dist,
+                policy_log_probs,
+                dim = 2, # vocab dimension
+                index = curr_seq.unsqueeze(-1) # (batch_size, target_seq_len, 1)
+            ).squeeze(-1) # (batch_size, target_seq_len)
+            ref_token_log_probs = torch.gather(
+                ref_log_probs,
                 dim = 2, # vocab dimension
                 index = curr_seq.unsqueeze(-1) # (batch_size, target_seq_len, 1)
             ).squeeze(-1) # (batch_size, target_seq_len)
@@ -564,7 +596,10 @@ class GRPOSampler:
             # Extract log probabilities for generated tokens only
             # Shift by 1 because logits at position t corresponds to token at position t+1
             generated_log_probs = token_log_probs[:, input_length - 1: -1] # (batch_size, generated_seq_len)
+            ref_generated_log_probs = ref_token_log_probs[:, input_length - 1: -1] # (batch_size, generated_seq_len)
+
             all_log_probs.append(generated_log_probs)
+            all_ref_log_probs.append(ref_generated_log_probs)
 
             # breakpoint()
             """
@@ -583,8 +618,9 @@ class GRPOSampler:
         
         # Stack Log Probabilities: (batch_size, group_size, target_seq_len)
         log_probs = torch.stack(all_log_probs, dim=1) # dim=1 for group_size
+        ref_log_probs = torch.stack(all_ref_log_probs, dim=1) # dim=1 for group_size
 
-        return log_probs
+        return log_probs, ref_log_probs
 
 # 2. Reward Calculation Module
 class ROUGERewardCalculator:
@@ -724,9 +760,11 @@ class GRPOLossCalculator:
         """
         self.beta = beta
 
-    def compute_loss(self, log_probs: torch.Tensor, 
+    def compute_loss(self, 
+                     log_probs: torch.Tensor, 
+                     ref_log_probs: torch.Tensor,
                      advantages: torch.Tensor,
-                     attention_mask: torch.Tensor) -> torch.Tensor:
+                     attention_mask: torch.Tensor) -> Tuple[torch.Tensor]:
         """
             Compute GRPO Policy Gradient Loss.
 
@@ -739,6 +777,12 @@ class GRPOLossCalculator:
                 - loss: scalar tensor representing the GRPO loss
         """
         batch_size, group_size, target_seq_len = log_probs.size()
+
+        # Convert to float for calculations
+        log_probs = log_probs.float()
+        ref_log_probs = ref_log_probs.float()
+        advantages = advantages.float()
+        attention_mask = attention_mask.float()
 
         # Sum log probabilities over sequence length to get sequence-level log probs
         if attention_mask is not None:
@@ -755,10 +799,33 @@ class GRPOLossCalculator:
         # >> Equation: - \Sum [Advantage * log_prob] <<
         policy_gradient_loss = -(advantages * sequence_log_probs).mean() # Mean over batch and group
 
-        return policy_gradient_loss
+        # KL Divergence Penalty
+        # Equation: KL(P || Q) = \Sum P(x) * (log P(x) - log Q(x))
+        if attention_mask is not None:
+            # KL per token
+            kl_per_token = log_probs - ref_log_probs # (batch_size, group_size, target_seq_len)
+            masked_kl = kl_per_token * attention_mask # Mask padding tokens
+
+            # Sum over Sequence Length, mean over batch and group
+            kl_divergence = masked_kl.sum(dim=-1).mean()
+        else:
+            kl_per_token = log_probs - ref_log_probs
+            kl_divergence = kl_per_token.sum(dim=-1).mean()
+
+        # Total Loss with KL Penalty
+        total_loss = policy_gradient_loss + self.beta * kl_divergence
+
+        # Metric Logging (Optional)
+        metrics = {
+            'policy_gradient_loss': policy_gradient_loss.item(),
+            'kl_divergence': kl_divergence.item(),
+            'total_loss': total_loss.item()
+        }
+
+        return total_loss, metrics
 
 # 4. Main Training Script Structure (Training Loop)
-def train_grpo_llama(model: nn.Module, dataloader: DataLoader, 
+def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: DataLoader, 
                optimizer: torch.optim.Optimizer, device: torch.device,
                tokenizer: AutoTokenizer, epoch: int = 3,
                group_size: int = 5, temperature: float = 1.0,
@@ -774,8 +841,12 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
             5. Backpropagation and Model Update.
     """
     model.train()
+    reference_model.eval() # Reference model in eval mode
+
     total_loss = 0.0
     total_reward = 0.0 
+    total_policy_gradient_loss = 0.0
+    total_kl_divergence = 0.0
 
     sampler = GRPOSampler(model, tokenizer, group_size, temperature)
     reward_calculator = ROUGERewardCalculator()
@@ -784,7 +855,6 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
     for step, batch in enumerate(dataloader):
         # Load on device
         # breakpoint()
-
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         reference_summaries = batch['summaries']  # List of strings
@@ -797,7 +867,7 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
             print("============================================")
 
         # 1. Generate group samples (K Samples per input)
-        generated_ids, log_probs = sampler.generate_group_samples(
+        generated_ids, log_probs, ref_log_probs = sampler.generate_group_samples(
             input_ids = input_ids,
             attention_mask = attention_mask,
             max_new_tokens = 32
@@ -808,7 +878,7 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
         # generated_ids: (batch_size, group_size, total_seq_len)
         # log_probs: (batch_size, group_size, generated_seq_len)
         batch_size, group_size, total_seq_len = generated_ids.size()
-        generated_seq_len = total_seq_len - input_ids.size(1)
+        # generated_seq_len = total_seq_len - input_ids.size(1)
 
         # breakpoint()
         
@@ -839,8 +909,9 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
         # Firstly, Create attention mask for generated sequences
         attention_mask_for_generation = (generated_ids[:, :, input_ids.size(1):] != tokenizer.pad_token_id).float()
 
-        loss = loss_calculator.compute_loss(
+        loss, metrics = loss_calculator.compute_loss(
             log_probs = log_probs,
+            ref_log_probs = ref_log_probs,
             advantages = advantages,
             attention_mask = attention_mask_for_generation
         )
@@ -853,6 +924,8 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
 
         total_loss += loss.item()
         total_reward += rewards.mean().item()
+        total_policy_gradient_loss += metrics['policy_gradient_loss']
+        total_kl_divergence += metrics['kl_divergence']
 
         if (step + 1) % 5 == 0:
             print(f" >> Step [{step+1}/{len(dataloader)}], Loss: {loss.item():.4f}, Avg Reward: {rewards.mean().item():.4f}")
@@ -891,10 +964,14 @@ def train_grpo_llama(model: nn.Module, dataloader: DataLoader,
             print(" -------------------------------------------------------------------")
 
 
-    avg_loss = total_loss / len(dataloader)
-    avg_reward = total_reward / len(dataloader)
+    avg_metrics = {
+        "loss": total_loss / len(dataloader),
+        "avg_reward": total_reward / len(dataloader),
+        "avg_policy_gradient_loss": total_policy_gradient_loss / len(dataloader),
+        "avg_kl_divergence": total_kl_divergence / len(dataloader)
+    }
 
-    return avg_loss, avg_reward
+    return avg_metrics["loss"], avg_metrics["avg_reward"], avg_metrics["avg_policy_gradient_loss"], avg_metrics["avg_kl_divergence"]
 
 # 5. Evaluation Loop
 def evaluate_grpo(model: nn.Module, dataloader: DataLoader,
@@ -1139,20 +1216,20 @@ def main():
             tokenizer = tokenizer
         )
 
-        print(f"   - ROGUE-1: {eval_results['rouge1']:.4f}")
-        print(f"   - ROGUE-2: {eval_results['rouge2']:.4f}")
-        print(f"   - ROGUE-L: {eval_results['rougeL']:.4f}")
+        print(f"   - ROUGE-1: {eval_results['rouge1']:.4f}")
+        print(f"   - ROUGE-2: {eval_results['rouge2']:.4f}")
+        print(f"   - ROUGE-L: {eval_results['rougeL']:.4f}")
 
         if eval_results["samples"]:
             print("   - Sample Generation:")
             for i, sample in enumerate(eval_results["samples"]):
                 print(f"      * Sample {i+1}:")
                 print("        - Input Dialogue:", sample["input_dialogue"])
-                print("        - Reference Summary:", sample["reference_summary"])
-                print("        - Generated Summary:", sample["generated_summary"])
+                print("        - Reference Summary:", sample["reference"])
+                print("        - Generated Summary:", sample["generated"])
 
         # Save best SFT model
-        if eval_results['rouge1'] > best_sft_rouge:
+        if eval_results['rougeL'] > best_sft_rouge:
             best_sft_rouge = eval_results["rougeL"]
             sft_model_save_path = "./sft_samsum_model"
             if isinstance(model, nn.DataParallel):
@@ -1162,8 +1239,23 @@ def main():
             print(f" >> Best SFT Model saved to {sft_model_save_path}")
         print("============================================")
 
-    train_loader = DataLoader(train_data, batch_size=grop_batch_size, shuffle=True, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
-    val_loader = DataLoader(val_data, batch_size=grop_batch_size, shuffle=False, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
+    print(" >> Creating Reference Model for GRPO...(Frozen Copy of SFT Model)")
+    reference_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype = torch.float32,
+        device_map = "auto"
+    )
+    # Load SFT weights into reference model
+    reference_model.load_state_dict(model.state_dict())
+    reference_model.eval() # Set to eval mode
+
+    for param in reference_model.parameters():
+        param.requires_grad = False # Freeze reference model
+
+    print(" >> Reference Model Created and Frozen.")
+
+    grpo_train_loader = DataLoader(train_data, batch_size=grop_batch_size, shuffle=True, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
+    grpo_val_loader = DataLoader(val_data, batch_size=grop_batch_size, shuffle=False, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
 
     # Initialize Optimizer
     optimizer = AdamW(model.parameters(), lr=grop_learning_rate)
@@ -1177,8 +1269,9 @@ def main():
         
         train_loss, avg_reward = train_grpo_llama(
             model = model,
+            reference_model = reference_model,
             tokenizer=tokenizer,
-            dataloader = train_loader,
+            dataloader = grpo_train_loader,
             optimizer = optimizer,
             device = device,
             group_size = grop_group_size,
@@ -1194,7 +1287,7 @@ def main():
         print(" >> Starting GRPO Evaluation on Test Set...")
         eval_results = evaluate_grpo(
             model = model,
-            dataloader = val_loader,
+            dataloader = grpo_val_loader,
             device = device,
             group_size = grop_group_size
         )
