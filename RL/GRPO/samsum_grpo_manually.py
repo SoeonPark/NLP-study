@@ -174,7 +174,10 @@ def evaluate_sft(model: nn.Module, dataloader: DataLoader,
             # Store sample outputs for analysis
             if step == 0:
                 for i in range(min(3, len(generated_summaries))):
+                    # Decode input dialogue for sample outputs
+                    input_text = tokenizer.decode(input_ids[i], skip_special_tokens=True)
                     sample_outputs.append({
+                        "input_dialogue": input_text,
                         "generated": generated_summaries[i],
                         "reference": summaries[i]
                     })
