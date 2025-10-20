@@ -1,4 +1,6 @@
 import os
+
+from sklearn import metrics
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 import warnings
@@ -48,6 +50,133 @@ from tqdm import tqdm
         7. Execution
 """
 
+# ========================================================================
+# Callback System for Training Management
+# ========================================================================
+
+class TrainingCallback:
+    """ Base class for training callbacks. """
+    def on_epoch_end(self, epoch: int, logs: Dict[str, Any] = None, model: nn.Module = None) -> None:
+        pass
+    def on_train_end(self, model: nn.Module = None) -> None:
+        pass
+
+class CheckpointCallback(TrainingCallback):
+    """
+        Saves checkpoints and manages best model based on evaluation metrics.
+            - Saves checkpoints at specified intervals.(every epoch)
+            - Tracks best model based on specified metric.
+    """
+    def __init__(self, save_dir: str, 
+                 best_metric: str = "rougeL", save_interval: int = 1,
+                 mode: str = "max", save_best_only: bool = True, 
+                 verbose: bool = True):
+        """
+            Args:
+                save_dir (str): Directory to save checkpoints.
+                best_metric (str): Metric to track the best model.
+                mode (str): "max" or "min" for the best metric.
+                save_best_only (bool): Whether to save only the best model.
+                verbose (bool): Whether to print messages.
+        """
+        self.save_dir = save_dir
+        self.save_dir = save_dir
+        self.save_interval = save_interval
+        self.best_metric = best_metric
+        self.mode = mode
+        self.save_best_only = save_best_only
+        self.verbose = verbose
+
+        os.makedirs(self.save_dir, exist_ok=True)
+
+        self.best_score = float("-inf") if mode == "max" else float("inf")
+        self.best_epoch = -1
+        self.best_model_path = None
+        self.history = []
+
+    def _is_better(self, current: float, best: float) -> bool:
+        """ Check if current metric is better than the best. """
+        if self.mode == "max":
+            return current > best
+        else:
+            return current < best
+
+    def on_epoch_end(self, epoch: int, metrics: Dict[str, float], model: nn.Module) -> bool:
+        """ Check if current metric is better than best based on mode. """
+        current_metric = metrics.get(self.best_metric)
+        if current_metric is None:
+            raise ValueError(f"Metric {self.best_metric} not found in logs.")
+        
+        # Save History
+        self.history.append(
+            {
+                "epoch": epoch,
+                **metrics
+            }
+        )
+
+        # Check if this is the best model
+        is_best = self._is_better(current_metric, self.best_score)
+
+        if is_best:
+            self.best_score = current_metric
+            self.best_epoch = epoch
+
+            # Save best model
+            best_path = self.save_dir / f"best_model_epoch_{epoch+1}.pt"
+            if isinstance(model, nn.DataParallel):
+                torch.save(model.module.state_dict(), best_path)
+            else:
+                torch.save(model.state_dict(), best_path)
+            self.best_model_path = best_path
+
+            if self.verbose:
+                print(f"New best model found at epoch {epoch+1} with {self.best_metric}: {current_metric:.4f}. Saved to {best_path}")
+
+        # Save epoch checkpoint
+        if not self.save_best_only:
+            epoch_path = self.save_dir / f"checkpoint_epoch_{epoch+1}.pt"
+            if isinstance(model, nn.DataParallel):
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.module.state_dict(),
+                    'metrics': metrics
+                }, epoch_path)
+            else:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'metrics': metrics
+                }, epoch_path)
+
+            if self.verbose:
+                print(f"Checkpoint saved for epoch {epoch} at {epoch_path}")
+
+    def on_train_end(self, model: nn.Module = None) -> None:
+        """ Load best model at the end of training. """
+        if self.best_model_path and self.best_model_path.exists():
+            if self.verbose:
+                print(f"Loading best model from {self.best_model_path} for final evaluation.")
+                
+            # Load best model weights
+            state_dict = torch.load(self.best_model_path)
+            if isinstance(model, nn.DataParallel):
+                model.module.load_state_dict(state_dict)
+            else:
+                model.load_state_dict(state_dict)
+
+        # Save training history
+        history_path = self.save_dir / "training_history.json"
+        import json
+        with open(history_path, 'w') as f:
+            json.dump(self.history, f, indent=4)
+        if self.verbose:
+            print(f"Training history saved to {history_path}")
+
+    def get_best_model_path(self) -> Optional[str]:
+        """ Returns the path of the best model checkpoint. """
+        return self.best_model_path
+    
 # ========================================================================
 # Supervised Fine-Tuning (SFT) Section for Policy Function Initialization
 #  - Purpose: Initialize the policy model before applying GRPO
@@ -1215,33 +1344,36 @@ def main():
 
     # SFT Hyperparameters
     print(" >> Setting up SFT Components...")
-    sft_learning_rate = 2e-5
-    sft_batch_size = 4
-    sft_num_epochs = 3
-
-    print("    - Learning Rate:", sft_learning_rate)
-    print("    - Batch Size:", sft_batch_size)
-    print("    - Number of Epochs:", sft_num_epochs)
+    sft_config = {
+        "sft_learning_rate": 2e-5,
+        "sft_batch_size": 4,
+        "sft_num_epochs": 1
+    }
+    print("    - Learning Rate:", sft_config["sft_learning_rate"])
+    print("    - Batch Size:", sft_config["sft_batch_size"])
+    print("    - Number of Epochs:", sft_config["sft_num_epochs"])
 
     # GRPO Hyperparameters
     print(" >> Setting up GRPO Components...")
-    grop_group_size = 5
-    grop_temperature = 0.7
-    grop_top_k = 50
-    grop_top_p = 0.95
-    grop_beta = 0.1
-    grop_learning_rate = 5e-5
-    grop_batch_size = 2
-    grop_num_epochs = 3
+    grop_config = {
+        "grop_group_size": 5,
+        "grop_temperature": 0.7,
+        "grop_top_k": 50,
+        "grop_top_p": 0.95,
+        "grop_beta": 0.1,
+        "grop_learning_rate": 5e-5,
+        "grop_batch_size": 2,
+        "grop_num_epochs": 3
+    }
 
-    print("    - Group Size:", grop_group_size)
-    print("    - Temperature:", grop_temperature)
-    print("    - Top-K:", grop_top_k)
-    print("    - Top-P:", grop_top_p)
-    print("    - Beta:", grop_beta)
-    print("    - Learning Rate:", grop_learning_rate)
-    print("    - Batch Size:", grop_batch_size)
-    print("    - Number of Epochs:", grop_num_epochs)
+    print("    - Group Size:", grop_config["grop_group_size"])
+    print("    - Temperature:", grop_config["grop_temperature"])
+    print("    - Top-K:", grop_config["grop_top_k"])
+    print("    - Top-P:", grop_config["grop_top_p"])
+    print("    - Beta:", grop_config["grop_beta"])
+    print("    - Learning Rate:", grop_config["grop_learning_rate"])
+    print("    - Batch Size:", grop_config["grop_batch_size"])
+    print("    - Number of Epochs:", grop_config["grop_num_epochs"])
 
     # Load Data for Training 
     train_data = dataset['train'].shuffle(seed=42)
@@ -1251,21 +1383,31 @@ def main():
     print(" >> Starting SFT Training... <<")
     print("============================================")
 
-    sft_train_loader = DataLoader(train_data, batch_size=sft_batch_size, shuffle=True, collate_fn=lambda x: sft_collate_fn(x, tokenizer))
-    sft_val_loader = DataLoader(val_data, batch_size=sft_batch_size, shuffle=False, collate_fn=lambda x: sft_collate_fn(x, tokenizer))
+    sft_train_loader = DataLoader(train_data, batch_size=sft_config["sft_batch_size"], shuffle=True, collate_fn=lambda x: sft_collate_fn(x, tokenizer))
+    sft_val_loader = DataLoader(val_data, batch_size=sft_config["sft_batch_size"], shuffle=False, collate_fn=lambda x: sft_collate_fn(x, tokenizer))
 
     # SFT Optimizer & Scheduler
-    sft_optimizer = AdamW(model.parameters(), lr=sft_learning_rate)
-    total_steps = len(sft_train_loader) * sft_num_epochs
+    sft_optimizer = AdamW(model.parameters(), lr=sft_config["sft_learning_rate"])
+    total_steps = len(sft_train_loader) * sft_config["sft_num_epochs"]
     sft_scheduler = get_linear_schedule_with_warmup(
         sft_optimizer,
         num_warmup_steps = int(0.1 * total_steps),
         num_training_steps = total_steps
     )
+    
+    # Create checkpoint callback for SFT
+    sft_checkpoint_callback = CheckpointCallback(
+        save_dir = "./sft_checkpoints",
+        save_interval = 1, # Save every epoch
+        best_metric="rougeL",
+        mode = "max",
+        save_best_only=False,
+        verbose = True
+    )
 
     best_sft_rouge = 0.0
-    for epoch in range(sft_num_epochs):
-        print(f" >> SFT Epoch {epoch+1}/{sft_num_epochs}")
+    for epoch in range(sft_config["sft_num_epochs"]):
+        print(f" >> SFT Epoch {epoch+1}/{sft_config['sft_num_epochs']}")
         
         sft_train_loss = train_sft(
             model = model,
@@ -1274,7 +1416,7 @@ def main():
             scheduler = sft_scheduler,
             device = device,
             epoch = epoch,
-            num_epochs = sft_num_epochs
+            num_epochs = sft_config["sft_num_epochs"]
         )
         print(f" >> SFT Epoch {epoch+1} Training Loss: {sft_train_loss:.4f}")
 
@@ -1299,17 +1441,29 @@ def main():
                 print("        - Reference Summary:", sample["reference"])
                 print("        - Generated Summary:", sample["generated"])
 
-        # Save best SFT model
-        if eval_results['rougeL'] > best_sft_rouge:
-            best_sft_rouge = eval_results["rougeL"]
-            sft_model_save_path = "./sft_samsum_model"
-            if isinstance(model, nn.DataParallel):
-                torch.save(model.module.state_dict(), sft_model_save_path)
-            else:
-                torch.save(model.state_dict(), sft_model_save_path)
-            print(f" >> Best SFT Model saved to {sft_model_save_path}")
-        print("============================================")
+        # Callback: Save Checkpoint and Track Best Model
+        metrics = {
+            "loss": sft_train_loss,
+            "rouge1": eval_results["rouge1"],
+            "rouge2": eval_results["rouge2"],
+            "rougeL": eval_results["rougeL"]
+        }
+        sft_checkpoint_callback.on_epoch_end(epoch, metrics, model)
 
+    sft_checkpoint_callback.on_train_end(model)
+    
+        # # Save best SFT model
+        # if eval_results['rougeL'] > best_sft_rouge:
+        #     best_sft_rouge = eval_results["rougeL"]
+        #     sft_model_save_path = "./sft_samsum_model"
+        #     if isinstance(model, nn.DataParallel):
+        #         torch.save(model.module.state_dict(), sft_model_save_path)
+        #     else:
+        #         torch.save(model.state_dict(), sft_model_save_path)
+        #     print(f" >> Best SFT Model saved to {sft_model_save_path}")
+
+    print(" >> SFT Training and Evaluation Completed.")
+    print("============================================")
     print(" >> Creating Reference Model for GRPO...(Frozen Copy of SFT Model)")
     reference_model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -1317,7 +1471,12 @@ def main():
         device_map = "auto"
     )
     # Load SFT weights into reference model
-    reference_model.load_state_dict(model.state_dict())
+    # reference_model.load_state_dict(model.state_dict())
+    best_sft_path = sft_checkpoint_callback.get_best_model_path()
+    if best_sft_path:
+        print(f" >> Loading Best SFT Model from {best_sft_path} into Reference Model...")
+        reference_model.load_state_dict(torch.load(best_sft_path))
+
     reference_model.eval() # Set to eval mode
 
     for param in reference_model.parameters():
@@ -1326,34 +1485,46 @@ def main():
     print(" >> Reference Model Created and Frozen.")
     print(f" >> Total Parameters in Reference Model: {sum(p.numel() for p in reference_model.parameters())}")
 
-    grpo_train_loader = DataLoader(train_data, batch_size=grop_batch_size, shuffle=True, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
-    grpo_val_loader = DataLoader(val_data, batch_size=grop_batch_size, shuffle=False, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
+    grpo_train_loader = DataLoader(train_data, batch_size=grop_config["grop_batch_size"], shuffle=True, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
+    grpo_val_loader = DataLoader(val_data, batch_size=grop_config["grop_batch_size"], shuffle=False, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
 
     # Initialize Optimizer
-    optimizer = AdamW(model.parameters(), lr=grop_learning_rate)
+    grpo_optimizer = AdamW(model.parameters(), lr=grop_config["grop_learning_rate"])
+
+    # Create checkpoint callback for GRPO
+    grpo_checkpoint_callback = CheckpointCallback(
+        save_path = "./grpo_checkpoints",
+        save_interval = 1, # Save every epoch
+        best_metric="rougeL",
+        mode = "max",
+        save_best_only=False,
+        verbose = True
+    )
 
     # Training Loop
     print("============================================")
     print(" >> Starting GRPO Training... <<")
     print("============================================")
-    for epoch in range(grop_num_epochs):
-        print(f" >> Epoch {epoch+1}/{grop_num_epochs}")
+    for epoch in range(grop_config["grop_num_epochs"]):
+        print(f" >> Epoch {epoch+1}/{grop_config['grop_num_epochs']}")
         
-        train_loss, avg_reward = train_grpo_llama(
+        train_metric = train_grpo_llama(
             model = model,
             reference_model = reference_model,
             tokenizer=tokenizer,
             dataloader = grpo_train_loader,
-            optimizer = optimizer,
+            optimizer = grpo_optimizer,
             device = device,
-            group_size = grop_group_size,
-            temperature = grop_temperature,
-            # top_k = grop_top_k,
-            # top_p = grop_top_p,
-            beta = grop_beta
+            group_size = grop_config["grop_group_size"],
+            temperature = grop_config["grop_temperature"],
+            # top_k = grop_config["grop_top_k"],
+            # top_p = grop_config["grop_top_p"],
+            beta = grop_config["grop_beta"]
         )
         print(f" >> Epoch {epoch+1} Training Result:")
-        print(f"    - Training Loss: {train_loss:.4f}, Average Reward: {avg_reward:.4f}")
+        print(f"    - Loss: {train_metric['loss']:.4f}, Average Reward: {train_metric['avg_reward']:.4f}")
+        print(f"    - Policy Gradient Loss: {train_metric['avg_policy_gradient_loss']:.4f}")
+        print(f"    - KL Divergence: {train_metric['avg_kl_divergence']:.4f}")
 
         # Evaluation Loop
         print(" >> Starting GRPO Evaluation on Test Set...")
@@ -1362,7 +1533,7 @@ def main():
             reference_model = reference_model,
             dataloader = grpo_val_loader,
             device = device,
-            group_size = grop_group_size
+            group_size = grop_config["grop_group_size"]
         )
         print(f" >> Epoch {epoch+1} Evaluation Results:")
         print(f"    - ROUGE-1: {eval_results['rouge1']:.4f}, ROUGE-L: {eval_results['rougeL']:.4f}")
@@ -1381,6 +1552,16 @@ def main():
                 print(f"        - Group Sample {i+1}: {gen_sum} | Reward: {reward:.4f}")
 
         print("============================================")
+        # Callback: Save Checkpoint and Track Best Model
+        metrics = {
+            "loss": train_metric["loss"],
+            "policy_gradient_loss": train_metric["policy_gradient_loss"],
+            "kl_divergence": train_metric["kl_divergence"],
+            "rouge1": eval_results["rouge1"],
+            "rougeL": eval_results["rougeL"],
+            "avg_reward": eval_results["avg_reward"],
+        }
+        grpo_checkpoint_callback.on_epoch_end(epoch, model, metrics)
 
     print(" >> GRPO Training and Evaluation Completed.")
 
