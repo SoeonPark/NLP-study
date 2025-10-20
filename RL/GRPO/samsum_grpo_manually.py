@@ -26,9 +26,18 @@ from tqdm import tqdm
         2. Reward Calculation using ROUGE
         2-1. Group-Relative Advantage Computation
         3. Modified Loss Function
-        4. Policy Gradient
-
-    Phase:
+        4. Policy Gradient Update
+    ------------------------------------------------------------------------------------
+    Training Pipeline Overview:
+    1. Supervised Fine-Tuning (SFT) Phase:
+        - To Initialize the Policy Model, Train the model using Supervised Fine-Tuning on the SAMSum dataset, only with few epochs.
+        - Evaluate with ROUGE1, 2, L metrics.
+    2. GRPO Phase:
+    - Main Training Loop with GRPO:
+        1. Generate K samples using sampling decoding strategy.
+        2. Compute ROUGE rewards for each sample.
+    ------------------------------------------------------------------------------------
+    GRPO Phases:
         1. Generate K samples using sampling decoding strategy.
         2. Compute ROUGE rewards for each sample.
         3. Normalize rewards within the group.
@@ -41,15 +50,20 @@ from tqdm import tqdm
 
 # ========================================================================
 # Supervised Fine-Tuning (SFT) Section for Policy Function Initialization
+#  - Purpose: Initialize the policy model before applying GRPO
+#  - Reason: Random/Pre-trained model may generate low-quality samples, leading to poor reward signals
+#  - Output: A model that can produce reasonable summaries (baseline policy)
 # ========================================================================
 
 def sft_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Dict[str, torch.Tensor]:
     """
-        Collate function for Supervised Fine-Tuning (SFT).
+        Collate function for Supervised Fine-Tuning (SFT). -- Prepare training data for Supervised Fine-Tuning.
         Pads input and target sequences to the maximum length in the batch.
 
         Args:
             - batch: List of samples from the dataset
+                -> It includes BOTH input dialogues and target summaries in the sequences. (Labels are set to -100.)
+                    Also, apply chat_template formatting.
             - tokenizer: Tokenizer for padding
 
         Returns:
@@ -64,16 +78,18 @@ def sft_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Dic
         messages = [
             {"role": "system", "content": "You are an expert summarizer. Summarize the following dialogue concisely."},
             {"role": "user", "content": dialogue},
-            {"role": "assistant", "content": summary}
+            {"role": "assistant", "content": summary} # <- Include summary as assistant content
         ]
         text = tokenizer.apply_chat_template(
             conversation = messages,
             tokenize = False,
-            add_generation_prompt = False
+            add_generation_prompt = False # We already have the assistant content
         )
         formatted_texts.append(text)
 
     # Tokenize inputs
+    # Tokenize with left padding for causal LM
+    tokenizer.padding_side = "left"
     encodings = tokenizer(
         formatted_texts,
         max_length = 512,
@@ -100,6 +116,9 @@ def train_sft(model: nn.Module, dataloader: DataLoader,
     """
         Supervised Fine-Tuning (SFT) Training Loop.
         This loop is for initializing the policy model before applying GRPO.
+
+        Loss Function: Cross-Entropy Loss between model outputs and target summaries.
+        Objective: Minimize Negative Log-Likelihood(NLL) of target summaries given input dialogues.
     """
     model.train()
     total_loss = 0.0
@@ -110,11 +129,11 @@ def train_sft(model: nn.Module, dataloader: DataLoader,
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
 
-        # Forward pass
+        # Forward pass: Model computes CE Loss 
         outputs = model(
             input_ids = input_ids,
             attention_mask = attention_mask,
-            labels = labels
+            labels = labels 
         )
         loss = outputs.loss
 
@@ -144,6 +163,10 @@ def evaluate_sft(model: nn.Module, dataloader: DataLoader,
     all_references = []
     sample_outputs = []
 
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"  # Switch to left padding for generation
+
+
     with torch.no_grad():
         for step, batch in enumerate(tqdm(dataloader, desc="SFT Evaluation")):
             input_ids = batch["input_ids"].to(device)
@@ -159,7 +182,10 @@ def evaluate_sft(model: nn.Module, dataloader: DataLoader,
                 do_sample = False,
                 num_beams = 1,
                 pad_token_id = tokenizer.pad_token_id,
-                eos_token_id = tokenizer.eos_token_id
+                eos_token_id = tokenizer.eos_token_id,
+                temperature = None, # do_sample is False
+                top_k = None,
+                top_p = None
             )
 
             # Decode generated summaries
@@ -182,6 +208,9 @@ def evaluate_sft(model: nn.Module, dataloader: DataLoader,
                         "reference": summaries[i]
                     })
 
+    # Restore original padding side
+    tokenizer.padding_side = original_padding_side
+
     # Compute ROUGE scores
     rouge_results = rouge.compute(
         predictions = all_predictions,
@@ -198,14 +227,33 @@ def evaluate_sft(model: nn.Module, dataloader: DataLoader,
 
 # ========================================
 # Group Reward Policy Optimization (GRPO)
+#  - Purpose: Further Optimize SFT model, trained previously, using GRPO method
+#  - Key Components:
+#    1. Group Sampling Module
+#    2. Reward Model
+#    3. Policy Optimization with GRPO Loss
+#  - Reward Signal: ROUGE Scores (This is NO human feedback setting)
 # ========================================
 
 # 1. Group Sampling Module
 class GRPOSampler:
-    def __init__(self, model: nn.Module, tokenizer: AutoTokenizer,
+    """
+        It handles Group Sampling and Log Probability Computation for GRPO.
+
+        Key Functions:
+            - generate_group_samples: Generate K diverse Samples per Input using sampling decoding.
+            - _compute_log_probs: Manually compute log probabilities of generated sequences.
+                -> Equation: \pi_{theta}(y|x), where y is generated summary, x is input dialogue.
+
+        >> The reason of generating K samples per input: <<
+            - Reduce variance in policy gradient estimation.
+            - Provide a richer set of samples for better reward signal estimation.
+    """
+    def __init__(self, model: nn.Module, reference_model: nn.Module, tokenizer: AutoTokenizer,
                  group_size: int = 5, temperature: float = 1.0,
                  top_k: int = 50, top_p: float = 0.95):
-        self.model = model
+        self.model = model # Policy Model
+        self.reference_model = reference_model # Frozen Reference Model (for KL penalty)
         self.tokenizer = tokenizer
         self.group_size = group_size
         self.temperature = temperature
@@ -229,7 +277,8 @@ class GRPOSampler:
                 - log_probs: (batch_size, group_size, target_seq_len) -- log probabilities of each generated token
 
             ====
-            >> The reason why use max_new_tokens, not max_length <<
+            Sampling Strategy:
+                - do_sample = True: Enable sampling for diversity.
         """
         self.model.eval()
         batch_size = input_ids.size(0)
@@ -512,6 +561,7 @@ class GRPOSampler:
                            input_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
             Compute Log Probabilities of generated sequences, Manually.
+             - equation: \pi_{\theta}(y|x)
 
             Args:
                 - input_ids: (batch_size, seq_len)
@@ -520,6 +570,16 @@ class GRPOSampler:
 
             Returns:
                 - log_probs: (batch_size, group_size, generated_seq_len)
+
+            ===
+            >> Why NO Labels in forward pass? <<
+                - ```labels = curr_seq``` would cause the model to compute loss internally and shift logits.
+                - We only need logits to manually comupute log probabilities for the generated tokens.
+
+            >> Log Probability Computation Logic: <<
+                - logits: (batch_size, target_seq_len, vocab_size); Raw model outputs
+                - log_probs: (batch_size, target_seq_len, vocab_size); Apply log_softmax to logits
+                - token_log_probs: (batch_size, target_seq_len); Gather log_probs for generated token ids
         """
         batch_size, group_size, total_seq_len = generated_ids.size() # Extract sizes
         device = generated_ids.device
@@ -977,11 +1037,13 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
     return avg_metrics["loss"], avg_metrics["avg_reward"], avg_metrics["avg_policy_gradient_loss"], avg_metrics["avg_kl_divergence"]
 
 # 5. Evaluation Loop
-def evaluate_grpo(model: nn.Module, dataloader: DataLoader,
+def evaluate_grpo(model: nn.Module, 
+                  reference_model: nn.Module, 
+                  dataloader: DataLoader,
                   device: torch.device, tokenizer: AutoTokenizer,
                   group_size: int = 5) -> Dict[str, Any]:
     model.eval()
-    sampler = GRPOSampler(model, tokenizer, group_size, temperature=0.7)
+    sampler = GRPOSampler(model, reference_model, tokenizer, group_size, temperature=0.7)
     reward_calculator = ROUGERewardCalculator()
 
     all_rewards = []
@@ -1078,6 +1140,10 @@ def grpo_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Di
         ) for messages in message_list
     ]
 
+    # Original Tokenization Process
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"  # Ensure left padding for causal models
+
     # Tokenize inputs (dialogues)
     inputs = tokenizer(
         formatted_inputs,
@@ -1088,6 +1154,8 @@ def grpo_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Di
         add_special_tokens = False
     )
 
+    tokenizer.padding_side = original_padding_side  # Restore original padding side
+    
     return {
         "input_ids": inputs.input_ids,
         "attention_mask": inputs.attention_mask,
@@ -1256,6 +1324,7 @@ def main():
         param.requires_grad = False # Freeze reference model
 
     print(" >> Reference Model Created and Frozen.")
+    print(f" >> Total Parameters in Reference Model: {sum(p.numel() for p in reference_model.parameters())}")
 
     grpo_train_loader = DataLoader(train_data, batch_size=grop_batch_size, shuffle=True, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
     grpo_val_loader = DataLoader(val_data, batch_size=grop_batch_size, shuffle=False, collate_fn=lambda x: grpo_collate_fn(x, tokenizer))
@@ -1290,6 +1359,7 @@ def main():
         print(" >> Starting GRPO Evaluation on Test Set...")
         eval_results = evaluate_grpo(
             model = model,
+            reference_model = reference_model,
             dataloader = grpo_val_loader,
             device = device,
             group_size = grop_group_size
