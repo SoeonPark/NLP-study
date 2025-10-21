@@ -18,6 +18,7 @@ import evaluate
 import math
 import numpy as np
 from tqdm import tqdm
+from pathlib import Path
 
 """
     This script is for implementing the GRPO (Group Reward Policy Optimization) method
@@ -54,6 +55,58 @@ from tqdm import tqdm
 # Callback System for Training Management
 # ========================================================================
 
+def save_model_and_tokenizer(model: nn.Module, tokenizer: AutoTokenizer,
+                             save_dir: str, model_name: str = "model"):
+    """
+        Save Model and Tokenizer using save_pretrained method.
+
+        Args:
+            model: Model to save (can be DataParallel wrapped)
+            tokenizer: Tokenizer to save
+            save_dir: Base directory to save
+            model_name: Name of the model subdirectory
+    """
+    save_path = Path(save_dir) / model_name
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    # Unwrap DataParallel if needed
+    model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+
+    # Save model
+    model_to_save.save_pretrained(save_path)
+    # Save tokenizer
+    tokenizer.save_pretrained(save_path)
+    print(f"Model and tokenizer saved to {save_path}")
+
+    return save_path
+
+def load_model_and_tokenizer(load_dir: str, device: str = "auto"):
+    """
+        Load Model and Tokenizer from save_pretrained directory.
+
+        Args:
+            load_dir: Directory containing saved model and tokenizer
+            device: Device to load model to ('auto', 'cpu', 'cuda', etc.)
+        Returns:
+            model, tokenizer    
+    """
+    load_path = Path(load_dir) 
+
+    if not load_path.exists():
+        raise ValueError(f"Directory {load_path} does not exist")
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(load_path)
+
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
+        load_path,
+        torch_dtype=torch.float32,
+        device_map=device
+    )
+    print(f"Model and tokenizer loaded from {load_path}")
+    return model, tokenizer
+
 class TrainingCallback:
     """ Base class for training callbacks. """
     def on_epoch_end(self, epoch: int, logs: Dict[str, Any] = None, model: nn.Module = None) -> None:
@@ -79,8 +132,7 @@ class CheckpointCallback(TrainingCallback):
                 save_best_only (bool): Whether to save only the best model.
                 verbose (bool): Whether to print messages.
         """
-        self.save_dir = save_dir
-        self.save_dir = save_dir
+        self.save_dir = Path(save_dir)
         self.save_interval = save_interval
         self.best_metric = best_metric
         self.mode = mode
@@ -123,51 +175,40 @@ class CheckpointCallback(TrainingCallback):
             self.best_epoch = epoch
 
             # Save best model
-            best_path = self.save_dir / f"best_model_epoch_{epoch+1}.pt"
-            if isinstance(model, nn.DataParallel):
-                torch.save(model.module.state_dict(), best_path)
-            else:
-                torch.save(model.state_dict(), best_path)
+            best_path = self.save_dir / f"best_model_epoch_{epoch+1}"
+            save_model_and_tokenizer(model, tokenizer=None, save_dir=self.save_dir, 
+                                    model_name=f"best_model_epoch_{epoch+1}")
             self.best_model_path = best_path
 
             if self.verbose:
-                print(f"New best model found at epoch {epoch+1} with {self.best_metric}: {current_metric:.4f}. Saved to {best_path}")
+                print(f"New best model at epoch {epoch} with {self.best_metric}: {current_metric:.4f}")
 
         # Save epoch checkpoint
         if not self.save_best_only:
-            epoch_path = self.save_dir / f"checkpoint_epoch_{epoch+1}.pt"
-            if isinstance(model, nn.DataParallel):
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.module.state_dict(),
-                    'metrics': metrics
-                }, epoch_path)
-            else:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'metrics': metrics
-                }, epoch_path)
-
+            epoch_path = self.save_dir / f"checkpoint_epoch_{epoch+1}"
+            save_model_and_tokenizer(model, tokenizer=None, save_dir=self.save_dir, 
+                                    model_name=f"checkpoint_epoch_{epoch+1}")
             if self.verbose:
                 print(f"Checkpoint saved for epoch {epoch} at {epoch_path}")
+
+        return is_best
 
     def on_train_end(self, model: nn.Module = None) -> None:
         """ Load best model at the end of training. """
         if self.best_model_path and self.best_model_path.exists():
             if self.verbose:
-                print(f"Loading best model from {self.best_model_path} for final evaluation.")
-                
-            # Load best model weights
-            state_dict = torch.load(self.best_model_path)
-            if isinstance(model, nn.DataParallel):
-                model.module.load_state_dict(state_dict)
-            else:
-                model.load_state_dict(state_dict)
+                print(f"Loading best model from epoch {self.best_epoch+1} with {self.best_metric}: {self.best_score:.4f}")
+            
+            # Load best model
+            loaded_model, _ = load_model_and_tokenizer(str(self.best_model_path))
+            
+            # Copy weights to the provided model
+            model_to_update = model.module if isinstance(model, nn.DataParallel) else model
+            model_to_update.load_state_dict(loaded_model.state_dict())
 
         # Save training history
-        history_path = self.save_dir / "training_history.json"
         import json
+        history_path = self.save_dir / "training_history.json"
         with open(history_path, 'w') as f:
             json.dump(self.history, f, indent=4)
         if self.verbose:
@@ -1398,6 +1439,7 @@ def main():
     # Create checkpoint callback for SFT
     sft_checkpoint_callback = CheckpointCallback(
         save_dir = "./sft_checkpoints",
+        tokenizer = tokenizer,
         save_interval = 1, # Save every epoch
         best_metric="rougeL",
         mode = "max",
@@ -1475,12 +1517,11 @@ def main():
     best_sft_path = sft_checkpoint_callback.get_best_model_path()
     if best_sft_path:
         print(f" >> Loading Best SFT Model from {best_sft_path} into Reference Model...")
-        reference_model.load_state_dict(torch.load(best_sft_path))
-
-    reference_model.eval() # Set to eval mode
-
-    for param in reference_model.parameters():
-        param.requires_grad = False # Freeze reference model
+        reference_model, _ = load_model_and_tokenizer(str(best_sft_path))
+        reference_model.eval()
+            
+        for param in reference_model.parameters():
+            param.requires_grad = False # Freeze reference model
 
     print(" >> Reference Model Created and Frozen.")
     print(f" >> Total Parameters in Reference Model: {sum(p.numel() for p in reference_model.parameters())}")
@@ -1494,6 +1535,7 @@ def main():
     # Create checkpoint callback for GRPO
     grpo_checkpoint_callback = CheckpointCallback(
         save_path = "./grpo_checkpoints",
+        tokenizer = tokenizer,
         save_interval = 1, # Save every epoch
         best_metric="rougeL",
         mode = "max",
@@ -1567,7 +1609,12 @@ def main():
 
     # Save the final model
     model_save_path = "./grpo_samsum_model"
-    torch.save(model.state_dict(), model_save_path)
+    final_save_path = save_model_and_tokenizer(
+        model = model,
+        tokenizer = tokenizer,
+        save_dir = model_save_path,
+        model_name = "grpo_samsum_model"
+    )
     print(f" >> Model saved to {model_save_path}")
 
 if __name__ == "__main__":
