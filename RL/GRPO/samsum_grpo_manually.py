@@ -1316,7 +1316,7 @@ def main():
     # GRPO Hyperparameters
     print(" >> Setting up GRPO Components...")
     grop_config = {
-        "grop_group_size": 5,
+        "grop_group_size": 4,
         "grop_temperature": 0.7,
         "grop_top_k": 50,
         "grop_top_p": 0.95,
