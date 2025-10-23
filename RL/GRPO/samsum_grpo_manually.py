@@ -296,9 +296,6 @@ class GRPOSampler:
 
         # Generate K size of samples
         with torch.no_grad():
-
-            model_to_use.gradient_checkpointing_disable()
-
             for k in range(self.group_size):
                 # Use model's generate method with sampling
                 generated_outputs = model_to_use.generate(
@@ -554,9 +551,8 @@ class GRPOSampler:
         # Stack generated ids: (batch_size, group_size, target_seq_len)
         generated_ids = torch.stack(padded_ids, dim=1) # dim=1 for group_size
 
+        # When computing log probs, need model in train mode for gradient checkpointing
         self.model.train()
-
-        model_to_use.gradient_checkpointing_enable()
 
         # Compute log probabilities for each generated sequence -- for generated part only
         # log_probs = self._compute_log_probs(generated_ids, input_ids.size(1)) # (batch_size, group_size, target_seq_len)
@@ -653,9 +649,8 @@ class GRPOSampler:
                     input_ids = curr_seq
                 )
                 ref_logits = ref_outputs.logits # (batch_size, total_seq_len, vocab_size)
-
-            # Compute log probabilities
-            ref_log_probs = F.log_softmax(ref_logits, dim=-1) # (batch_size, total_seq_len, vocab_size)
+                # Compute log probabilities
+                ref_log_probs = F.log_softmax(ref_logits, dim=-1) # (batch_size, total_seq_len, vocab_size)
 
             # Gather Log Probabilities of generated tokens
             token_log_probs = torch.gather(
@@ -686,8 +681,12 @@ class GRPOSampler:
 
             # Extract log probabilities for generated tokens only
             # Shift by 1 because logits at position t corresponds to token at position t+1
-            generated_log_probs = token_log_probs[:, input_length - 1: -1] # (batch_size, logits_to_keep)
-            ref_generated_log_probs = ref_token_log_probs[:, input_length - 1: -1] # (batch_size, logits_to_keep)
+            generated_start_index = input_length - 1
+            generated_end_index = total_seq_len - 1
+            logits_to_keep = generated_end_index - generated_start_index + 1
+
+            generated_log_probs = token_log_probs[:, generated_start_index:generated_end_index] # (batch_size, logits_to_keep)
+            ref_generated_log_probs = ref_token_log_probs[:, generated_start_index:generated_end_index] # (batch_size, logits_to_keep)
 
             all_log_probs.append(generated_log_probs)
             all_ref_log_probs.append(ref_generated_log_probs)
@@ -707,9 +706,9 @@ class GRPOSampler:
                     478     
             """
         
-        # Stack Log Probabilities: (batch_size, group_size, target_seq_len)
-        log_probs = torch.stack(all_log_probs, dim=1) # dim=1 for group_size
-        ref_log_probs = torch.stack(all_ref_log_probs, dim=1) # dim=1 for group_size
+        # Stack Log Probabilities: (batch_size, group_size, generated_seq_len)
+        log_probs = torch.stack(all_log_probs, dim=1) 
+        ref_log_probs = torch.stack(all_ref_log_probs, dim=1) 
 
         return log_probs, ref_log_probs
 
@@ -927,7 +926,29 @@ def verify_log_probs(model, generated_ids, log_probs, input_length, tokenizer,
     
     model.train()
     print("="*80 + "\n")
+
+def verify_gradients(model, loss):
+    print("\n" + "="*80)
+    print("GRADIENT VERIFICATION")
+    print("="*80)
     
+    has_grad = False
+    max_grad = 0.0
+    min_grad = float('inf')
+
+    for name, param in model.named_parameters():
+        if param.requires_grad and param.grad is not None:
+            has_grad = True
+            param_max = param.grad.norm().item()
+            max_grad = max(max_grad, param_max)
+            min_grad = min(min_grad, param_max)
+
+            if 'lora' in name.lower():
+                print(f"Param: {name}, Grad Norm: {param_max:.6f}")
+
+    print(f"\nOverall Grad Norms - {has_grad} Max: {max_grad:.6f}, Min: {min_grad:.6f}")
+
+    return has_grad
 
 # 4. Main Training Script Structure (Training Loop)
 def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: DataLoader, 
@@ -994,22 +1015,41 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
         # breakpoint()
         
         # 2. Compute ROUGE rewards for each generated sample
-        generated_texts = []
-        for batch in range(batch_size):
+        generated_texts_2d = []  # To store indices of generated texts for each batch
+        for batch_idx in range(batch_size):
+            batch_samples = []
             for k in range(group_size):
                 # Extract only the generated tokens (After input length)
-                generated_tokens = generated_ids[batch, k, input_ids.size(1):] # (logits_to_keep)
+                generated_tokens = generated_ids[batch_idx, k, input_ids.size(1):] # (logits_to_keep)
                 generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                generated_texts.append(generated_text)
+                batch_samples.append(generated_text)
+            generated_texts_2d.append(batch_samples)
 
-        # breakpoint()
-        
-        # 3. Compute Rewards
+        # Flatten generated_texts_2d for reward computation
+        generated_text = [text for batch_samples in generated_texts_2d for text in batch_samples]
+
         rewards = reward_calculator.compute_rewards(
-            generated_summaries = generated_texts,
+            generated_summaries = generated_text,
             reference_summaries = reference_summaries,
             group_size = group_size
         ).to(device) # (batch_size, group_size)
+
+        # generated_texts = []
+        # for batch in range(batch_size):
+        #     for k in range(group_size):
+        #         # Extract only the generated tokens (After input length)
+        #         generated_tokens = generated_ids[batch, k, input_ids.size(1):] # (logits_to_keep)
+        #         generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        #         generated_texts.append(generated_text)
+
+        # # breakpoint()
+        
+        # # 3. Compute Rewards
+        # rewards = reward_calculator.compute_rewards(
+        #     generated_summaries = generated_texts,
+        #     reference_summaries = reference_summaries,
+        #     group_size = group_size
+        # ).to(device) # (batch_size, group_size)
 
         # breakpoint()
         
@@ -1030,6 +1070,11 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
         # Backpropagation and Optimization
         optimizer.zero_grad()
         loss.backward()
+        if step == 0:
+            has_grad = verify_gradients(model, loss)
+            if not has_grad:
+                raise ValueError("No gradients found in the model parameters.")
+            
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Gradient Clipping
         optimizer.step()
 
@@ -1040,6 +1085,7 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
 
         if (step + 1) % 1 == 0:
             print(f" >> Step [{step+1}/{len(dataloader)}], Loss: {loss.item():.4f}, Avg Reward: {rewards.mean().item():.4f}")
+            display_batch_index = 0
 
             # # Print Sample Generation
             # if step == 0:
@@ -1067,23 +1113,22 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
             print(full_padded_input_text) 
             print(f"\n    - Input Dialogue (Clean Prompt, Special Tokens Intact - for context):")
             print(clean_input_text)
-            print(f"   - Reference Summary: {reference_summaries[0]}")
+            print(f"   - Reference Summary: {reference_summaries[display_batch_index]}")
             for k in range(group_size):
                 # generated_texts List is flattened, so calculate the correct index
-                sample_index_in_flat_list = k 
-                print(f"        -> Generated Sample {k+1}: {generated_texts[sample_index_in_flat_list]} | Reward: {rewards[0, k].item():.4f}")
+                print(f"        -> Generated Sample {k+1}: {generated_texts_2d[display_batch_index][k]} | Reward: {rewards[display_batch_index, k].item():.4f}")
             print(" -------------------------------------------------------------------")
 
-            print_token_details(
-                generated_ids, log_probs, tokenizer,
-                batch_idx=0, sample_idx=0, num_tokens=10
-            )
+            # print_token_details(
+            #     generated_ids, log_probs, tokenizer,
+            #     batch_idx=0, sample_idx=0, num_tokens=10
+            # )
 
-            verify_log_probs(
-                model, generated_ids, log_probs, input_length=input_ids.size(1),
-                tokenizer=tokenizer,
-                batch_idx=0, sample_idx=0, num_check=5
-            )
+            # verify_log_probs(
+            #     model, generated_ids, log_probs, input_length=input_ids.size(1),
+            #     tokenizer=tokenizer,
+            #     batch_idx=0, sample_idx=0, num_check=5
+            # )
 
 
     avg_metrics = {
