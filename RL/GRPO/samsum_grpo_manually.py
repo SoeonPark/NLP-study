@@ -9,7 +9,7 @@ warnings.filterwarnings("ignore")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, T5ForConditionalGeneration, get_linear_schedule_with_warmup
+from transformers import AutoModelForCausalLM, AutoTokenizer, T5ForConditionalGeneration, get_linear_schedule_with_warmup, BitsAndBytesConfig
 from datasets import load_dataset
 from typing import List, Optional, Tuple, Dict, Any
 from torch.utils.data import DataLoader
@@ -19,6 +19,8 @@ import math
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
+
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 """
     This script is for implementing the GRPO (Group Reward Policy Optimization) method
@@ -32,10 +34,7 @@ from pathlib import Path
         4. Policy Gradient Update
     ------------------------------------------------------------------------------------
     Training Pipeline Overview:
-    1. Supervised Fine-Tuning (SFT) Phase:
-        - To Initialize the Policy Model, Train the model using Supervised Fine-Tuning on the SAMSum dataset, only with few epochs.
-        - Evaluate with ROUGE1, 2, L metrics.
-    2. GRPO Phase:
+    1. GRPO Phase:
     - Main Training Loop with GRPO:
         1. Generate K samples using sampling decoding strategy.
         2. Compute ROUGE rewards for each sample.
@@ -218,183 +217,6 @@ class CheckpointCallback(TrainingCallback):
         """ Returns the path of the best model checkpoint. """
         return self.best_model_path
     
-# ========================================================================
-# Supervised Fine-Tuning (SFT) Section for Policy Function Initialization
-#  - Purpose: Initialize the policy model before applying GRPO
-#  - Reason: Random/Pre-trained model may generate low-quality samples, leading to poor reward signals
-#  - Output: A model that can produce reasonable summaries (baseline policy)
-# ========================================================================
-
-def sft_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Dict[str, torch.Tensor]:
-    """
-        Collate function for Supervised Fine-Tuning (SFT). -- Prepare training data for Supervised Fine-Tuning.
-        Pads input and target sequences to the maximum length in the batch.
-
-        Args:
-            - batch: List of samples from the dataset
-                -> It includes BOTH input dialogues and target summaries in the sequences. (Labels are set to -100.)
-                    Also, apply chat_template formatting.
-            - tokenizer: Tokenizer for padding
-
-        Returns:
-            - collated_batch: Dictionary containing padded input_ids, attention_mask, labels
-    """
-    dialogues = [item['dialogue'] for item in batch]
-    summaries = [item['summary'] for item in batch]
-
-    # Format with chat_template
-    formatted_texts = []
-    for dialogue, summary in zip(dialogues, summaries):
-        messages = [
-            {"role": "system", "content": "You are an expert summarizer. Summarize the following dialogue concisely."},
-            {"role": "user", "content": dialogue},
-            {"role": "assistant", "content": summary} # <- Include summary as assistant content
-        ]
-        text = tokenizer.apply_chat_template(
-            conversation = messages,
-            tokenize = False,
-            add_generation_prompt = False # We already have the assistant content
-        )
-        formatted_texts.append(text)
-
-    # Tokenize inputs
-    # Tokenize with left padding for causal LM
-    tokenizer.padding_side = "left"
-    encodings = tokenizer(
-        formatted_texts,
-        max_length = 512,
-        padding = True,
-        truncation = True,
-        return_tensors = 'pt'
-    )
-
-    # Labels are the same as input_ids for causal LM
-    labels = encodings.input_ids.clone()
-    labels[labels == tokenizer.pad_token_id] = -100 # Ignore padding tokens in loss computation
-
-    return {
-        'input_ids': encodings.input_ids,
-        'attention_mask': encodings.attention_mask,
-        'labels': labels,
-        'summary': summaries 
-    }
-
-def train_sft(model: nn.Module, dataloader: DataLoader,
-              optimizer: torch.optim.Optimizer, scheduler: Any,
-              device: torch.device, epoch: int, num_epochs: int = 3) -> float:
-
-    """
-        Supervised Fine-Tuning (SFT) Training Loop.
-        This loop is for initializing the policy model before applying GRPO.
-
-        Loss Function: Cross-Entropy Loss between model outputs and target summaries.
-        Objective: Minimize Negative Log-Likelihood(NLL) of target summaries given input dialogues.
-    """
-    model.train()
-    total_loss = 0.0
-    progress_bar = tqdm(dataloader, desc=f"SFT Epoch {epoch+1}/{num_epochs}")
-
-    for step, batch in enumerate(progress_bar):
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
-
-        # Forward pass: Model computes CE Loss 
-        outputs = model(
-            input_ids = input_ids,
-            attention_mask = attention_mask,
-            labels = labels 
-        )
-        loss = outputs.loss
-
-        # Backward pass and optimization
-        optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
-
-        total_loss += loss.item()
-        progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-        if (step + 1) % 100 == 0:
-            avg_loss = total_loss / (step + 1)
-            print(f"Step [{step+1}/{len(dataloader)}] | Average Loss: {avg_loss:.4f} | Loss: {loss.item():.4f}")
-
-    avg_epoch_loss = total_loss / len(dataloader)
-    return avg_epoch_loss
-
-def evaluate_sft(model: nn.Module, dataloader: DataLoader,
-                device: torch.device, tokenizer: AutoTokenizer) -> Dict[str, float]:
-    model.eval()
-    rouge = evaluate.load('rouge')
-
-    all_predictions = []
-    all_references = []
-    sample_outputs = []
-
-    original_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"  # Switch to left padding for generation
-
-
-    with torch.no_grad():
-        for step, batch in enumerate(tqdm(dataloader, desc="SFT Evaluation")):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            summaries = batch["summary"]
-
-            # Generate summaries
-            model_to_use = model.module if isinstance(model, nn.DataParallel) else model
-            generated_ids = model_to_use.generate(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                max_new_tokens = 64,
-                do_sample = False,
-                num_beams = 1,
-                pad_token_id = tokenizer.pad_token_id,
-                eos_token_id = tokenizer.eos_token_id,
-                temperature = None, # do_sample is False
-                top_k = None,
-                top_p = None
-            )
-
-            # Decode generated summaries
-            generated_summaries = tokenizer.batch_decode(
-                generated_ids[:, input_ids.size(1):],
-                skip_special_tokens = True,
-            )
-
-            all_predictions.extend(generated_summaries)
-            all_references.extend(summaries)
-
-            # Store sample outputs for analysis
-            if step == 0:
-                for i in range(min(3, len(generated_summaries))):
-                    # Decode input dialogue for sample outputs
-                    input_text = tokenizer.decode(input_ids[i], skip_special_tokens=True)
-                    sample_outputs.append({
-                        "input_dialogue": input_text,
-                        "generated": generated_summaries[i],
-                        "reference": summaries[i]
-                    })
-
-    # Restore original padding side
-    tokenizer.padding_side = original_padding_side
-
-    # Compute ROUGE scores
-    rouge_results = rouge.compute(
-        predictions = all_predictions,
-        references= all_references,
-        use_stemmer = True
-    )
-
-    return {
-        "rouge1": rouge_results["rouge1"],
-        "rouge2": rouge_results["rouge2"],
-        "rougeL": rouge_results["rougeL"],
-        "samples": sample_outputs
-    }
-
 # ========================================
 # Group Reward Policy Optimization (GRPO)
 #  - Purpose: Further Optimize SFT model, trained previously, using GRPO method
@@ -544,7 +366,7 @@ class GRPOSampler:
                             torch.Size([1, 50257])
                     ```
                 """
-                # generated_outputs: (batch_size, generated_seq_lens)
+                # generated_outputs: (batch_size, logits_to_keep)
             all_generated_ids.append(generated_outputs)
             max_length = max(max_length, generated_outputs.size(1))
 
@@ -739,7 +561,12 @@ class GRPOSampler:
                 - generated_ids: (batch_size, group_size, total_seq_len)
 
             Returns:
-                - log_probs: (batch_size, group_size, generated_seq_len)
+                - log_probs: (batch_size, group_size, logits_to_keep)
+
+            ===
+            Args Description:
+                - curr_seq: Input for the model, when compute the log probabilities, this works as the answer token index.
+                    It includes both input dialogue and generated summary. (curr_seq = Input_prompt + Generated_summary)
 
             ===
             >> Why NO Labels in forward pass? <<
@@ -747,9 +574,9 @@ class GRPOSampler:
                 - We only need logits to manually comupute log probabilities for the generated tokens.
 
             >> Log Probability Computation Logic: <<
-                - logits: (batch_size, target_seq_len, vocab_size); Raw model outputs
-                - log_probs: (batch_size, target_seq_len, vocab_size); Apply log_softmax to logits
-                - token_log_probs: (batch_size, target_seq_len); Gather log_probs for generated token ids
+                - logits: (batch_size, total_seq_len, vocab_size); Raw model outputs
+                - log_probs: (batch_size, total_seq_len, vocab_size); Apply log_softmax to logits
+                - token_log_probs: (batch_size, total_seq_len); Gather log_probs for generated token ids
         """
         batch_size, group_size, total_seq_len = generated_ids.size() # Extract sizes
         device = generated_ids.device
@@ -778,45 +605,39 @@ class GRPOSampler:
             # breakpoint()
         
             curr_seq = generated_ids[:, k, :] # (batch_size, total_seq_len)
+            # All batches of sequence for the k-th sample in the group
 
             # Remove Labels and Compute Logits
-            with torch.no_grad():
-                # Policy Model Logits
-                policy_outputs = model_to_use(
-                    input_ids = curr_seq
-                )
-                policy_logits = policy_outputs.logits # (batch_size, target_seq_len, vocab_size)
+            # [FIX FLAG] Policy Model requires Graident TO TRAIN!!!!!
+            policy_outputs = model_to_use( # Newly generated sequences as input
+                input_ids = curr_seq
+            )
+            policy_logits = policy_outputs.logits # (batch_size, total_seq_len, vocab_size) -- Raw logits from the model
+            policy_log_probs = F.log_softmax(policy_logits, dim=-1) # (batch_size, total_seq_len, vocab_size)
 
-                # Reference Model Logits
+            # [FIX FLAG] Reference Model is FROZEN!!!!!
+            with torch.no_grad():
                 ref_outputs = ref_model_to_use(
                     input_ids = curr_seq
                 )
-                ref_logits = ref_outputs.logits # (batch_size, target_seq_len, vocab_size
-
-            policy_logits = policy_outputs.float()
-            ref_logits = ref_outputs.float()
-
-            # outputs = model_to_use(
-            #         input_ids = curr_seq,
-            #         labels = curr_seq
-            #     )
-            # logits = outputs.logits # (batch_size, target_seq_len, vocab_size)
+                ref_logits = ref_outputs.logits # (batch_size, total_seq_len, vocab_size)
 
             # Compute log probabilities
-            policy_log_probs = F.log_softmax(policy_logits, dim=-1) # (batch_size, target_seq_len, vocab_size)
-            ref_log_probs = F.log_softmax(ref_logits, dim=-1) # (batch_size, target_seq_len, vocab_size)
+            ref_log_probs = F.log_softmax(ref_logits, dim=-1) # (batch_size, total_seq_len, vocab_size)
 
             # Gather Log Probabilities of generated tokens
             token_log_probs = torch.gather(
                 policy_log_probs,
-                dim = 2, # vocab dimension
+                dim = 2, 
                 index = curr_seq.unsqueeze(-1) # (batch_size, target_seq_len, 1)
             ).squeeze(-1) # (batch_size, target_seq_len)
+            breakpoint()
             ref_token_log_probs = torch.gather(
                 ref_log_probs,
                 dim = 2, # vocab dimension
                 index = curr_seq.unsqueeze(-1) # (batch_size, target_seq_len, 1)
             ).squeeze(-1) # (batch_size, target_seq_len)
+            breakpoint()
             """
                 >> Why unsqueeze and squeeze? <<
                     - unsqueeze: to match dimensions for gather
@@ -828,8 +649,8 @@ class GRPOSampler:
 
             # Extract log probabilities for generated tokens only
             # Shift by 1 because logits at position t corresponds to token at position t+1
-            generated_log_probs = token_log_probs[:, input_length - 1: -1] # (batch_size, generated_seq_len)
-            ref_generated_log_probs = ref_token_log_probs[:, input_length - 1: -1] # (batch_size, generated_seq_len)
+            generated_log_probs = token_log_probs[:, input_length - 1: -1] # (batch_size, logits_to_keep)
+            ref_generated_log_probs = ref_token_log_probs[:, input_length - 1: -1] # (batch_size, logits_to_keep)
 
             all_log_probs.append(generated_log_probs)
             all_ref_log_probs.append(ref_generated_log_probs)
@@ -1109,9 +930,9 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
         # breakpoint()
         
         # generated_ids: (batch_size, group_size, total_seq_len)
-        # log_probs: (batch_size, group_size, generated_seq_len)
+        # log_probs: (batch_size, group_size, logits_to_keep)
         batch_size, group_size, total_seq_len = generated_ids.size()
-        # generated_seq_len = total_seq_len - input_ids.size(1)
+        # logits_to_keep = total_seq_len - input_ids.size(1)
 
         # breakpoint()
         
@@ -1120,7 +941,7 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
         for batch in range(batch_size):
             for k in range(group_size):
                 # Extract only the generated tokens (After input length)
-                generated_tokens = generated_ids[batch, k, input_ids.size(1):] # (generated_seq_len)
+                generated_tokens = generated_ids[batch, k, input_ids.size(1):] # (logits_to_keep)
                 generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
                 generated_texts.append(generated_text)
 
@@ -1239,7 +1060,7 @@ def evaluate_grpo(model: nn.Module,
             generated_texts = []
             for batch in range(batch_size):
                 for k in range(group_size):
-                    generated_tokens = generated_ids[batch, k, input_ids.size(1):] # (generated_seq_len)
+                    generated_tokens = generated_ids[batch, k, input_ids.size(1):] # (logits_to_keep)
                     generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
                     generated_texts.append(generated_text)
 
@@ -1349,13 +1170,19 @@ def main():
 
     # Initionalize Tokenizer and Model
     print(" >> Initializing Tokenizer and Model...")
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
+    model_name = "meta-llama/Llama-3.1-8B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
-    model = AutoModelForCausalLM.from_pretrained(
+    original_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype = torch.float32,
         device_map = "auto"
     )
+    original_reference_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype = torch.float32,
+        device_map = "auto"
+    )
+
 
     # Set pad token and Ensure for other tokens if not exist
     print(" >> Setting up Tokenizer Special Tokens...")
@@ -1364,7 +1191,7 @@ def main():
     if tokenizer.pad_token is None:
         print("    - Setting PAD token as EOS token...")
         tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = tokenizer.eos_token_id
+        original_model.config.pad_token_id = tokenizer.eos_token_id
     print(f"   - PAD Token ID: {tokenizer.pad_token_id}")
     print(f"   - EOS Token ID: {tokenizer.eos_token_id}")
     print(f"   - BOS Token ID: {tokenizer.bos_token_id}")
@@ -1380,19 +1207,42 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     # model.to(device)
 
-    print(f" >> Using Device: {device}")
-    print(f" >> Total Parameters: {sum(p.numel() for p in model.parameters())}")
+    lora_config = LoraConfig(
+        r = 8,
+        lora_alpha=16,
+        lora_dropout = 0.05,
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        task_type = "CAUSAL_LM",
+        bias="none",
+    )
+    model = get_peft_model(original_model, lora_config)
+    reference_model = np.copy.deepcopy(original_reference_model)
 
-    # SFT Hyperparameters
-    print(" >> Setting up SFT Components...")
-    sft_config = {
-        "sft_learning_rate": 2e-5,
-        "sft_batch_size": 4,
-        "sft_num_epochs": 1
-    }
-    print("    - Learning Rate:", sft_config["sft_learning_rate"])
-    print("    - Batch Size:", sft_config["sft_batch_size"])
-    print("    - Number of Epochs:", sft_config["sft_num_epochs"])
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit = True,
+        bnb_4bit_use_double_quant = True,
+        bnb_4bit_quant_type = 'nf4',
+        bnb_4bit_compute_type = torch.float16
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config = bnb_config,
+        device_map = "auto",
+    )
+    model = prepare_model_for_kbit_training(model)
+    model = get_peft_model(model, lora_config)
+    reference_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config = bnb_config,
+        device_map = "auto",
+    )
+    reference_model = prepare_model_for_kbit_training(reference_model)
+
+    print(f" >> Using Device: {device}")
+    print(f" >> [Original Model] Total Parameters: {sum(p.numel() for p in original_model.parameters())}")
+    print(f" >> [Original Reference Model] Total Parameters: {sum(p.numel() for p in original_reference_model.parameters())}")
+    print(f" >> [PEFT Model] Total Parameters: {sum(p.numel() for p in model.parameters())}")
+    print(f" >> [PEFT Reference Model] Total Parameters: {sum(p.numel() for p in reference_model.parameters())}")
 
     # GRPO Hyperparameters
     print(" >> Setting up GRPO Components...")
@@ -1419,109 +1269,6 @@ def main():
     # Load Data for Training 
     train_data = dataset['train'].shuffle(seed=42)
     val_data = dataset['validation'].shuffle(seed=42)
-
-    print("============================================")
-    print(" >> Starting SFT Training... <<")
-    print("============================================")
-
-    sft_train_loader = DataLoader(train_data, batch_size=sft_config["sft_batch_size"], shuffle=True, collate_fn=lambda x: sft_collate_fn(x, tokenizer))
-    sft_val_loader = DataLoader(val_data, batch_size=sft_config["sft_batch_size"], shuffle=False, collate_fn=lambda x: sft_collate_fn(x, tokenizer))
-
-    # SFT Optimizer & Scheduler
-    sft_optimizer = AdamW(model.parameters(), lr=sft_config["sft_learning_rate"])
-    total_steps = len(sft_train_loader) * sft_config["sft_num_epochs"]
-    sft_scheduler = get_linear_schedule_with_warmup(
-        sft_optimizer,
-        num_warmup_steps = int(0.1 * total_steps),
-        num_training_steps = total_steps
-    )
-    
-    # Create checkpoint callback for SFT
-    sft_checkpoint_callback = CheckpointCallback(
-        save_dir = "./sft_checkpoints",
-        tokenizer = tokenizer,
-        save_interval = 1, # Save every epoch
-        best_metric="rougeL",
-        mode = "max",
-        save_best_only=False,
-        verbose = True
-    )
-
-    best_sft_rouge = 0.0
-    for epoch in range(sft_config["sft_num_epochs"]):
-        print(f" >> SFT Epoch {epoch+1}/{sft_config['sft_num_epochs']}")
-        
-        sft_train_loss = train_sft(
-            model = model,
-            dataloader = sft_train_loader,
-            optimizer = sft_optimizer,
-            scheduler = sft_scheduler,
-            device = device,
-            epoch = epoch,
-            num_epochs = sft_config["sft_num_epochs"]
-        )
-        print(f" >> SFT Epoch {epoch+1} Training Loss: {sft_train_loss:.4f}")
-
-        # SFT Evaluation
-        print(" >> Starting SFT Evaluation on Validation Set...")
-        eval_results = evaluate_sft(
-            model = model,
-            dataloader = sft_val_loader,
-            device = device,
-            tokenizer = tokenizer
-        )
-
-        print(f"   - ROUGE-1: {eval_results['rouge1']:.4f}")
-        print(f"   - ROUGE-2: {eval_results['rouge2']:.4f}")
-        print(f"   - ROUGE-L: {eval_results['rougeL']:.4f}")
-
-        if eval_results["samples"]:
-            print("   - Sample Generation:")
-            for i, sample in enumerate(eval_results["samples"]):
-                print(f"      * Sample {i+1}:")
-                print("        - Input Dialogue:", sample["input_dialogue"])
-                print("        - Reference Summary:", sample["reference"])
-                print("        - Generated Summary:", sample["generated"])
-
-        # Callback: Save Checkpoint and Track Best Model
-        metrics = {
-            "loss": sft_train_loss,
-            "rouge1": eval_results["rouge1"],
-            "rouge2": eval_results["rouge2"],
-            "rougeL": eval_results["rougeL"]
-        }
-        sft_checkpoint_callback.on_epoch_end(epoch, metrics, model)
-
-    sft_checkpoint_callback.on_train_end(model)
-    
-        # # Save best SFT model
-        # if eval_results['rougeL'] > best_sft_rouge:
-        #     best_sft_rouge = eval_results["rougeL"]
-        #     sft_model_save_path = "./sft_samsum_model"
-        #     if isinstance(model, nn.DataParallel):
-        #         torch.save(model.module.state_dict(), sft_model_save_path)
-        #     else:
-        #         torch.save(model.state_dict(), sft_model_save_path)
-        #     print(f" >> Best SFT Model saved to {sft_model_save_path}")
-
-    print(" >> SFT Training and Evaluation Completed.")
-    print("============================================")
-    print(" >> Creating Reference Model for GRPO...(Frozen Copy of SFT Model)")
-    reference_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype = torch.float32,
-        device_map = "auto"
-    )
-    # Load SFT weights into reference model
-    # reference_model.load_state_dict(model.state_dict())
-    best_sft_path = sft_checkpoint_callback.get_best_model_path()
-    if best_sft_path:
-        print(f" >> Loading Best SFT Model from {best_sft_path} into Reference Model...")
-        reference_model, _ = load_model_and_tokenizer(str(best_sft_path))
-        reference_model.eval()
-            
-        for param in reference_model.parameters():
-            param.requires_grad = False # Freeze reference model
 
     print(" >> Reference Model Created and Frozen.")
     print(f" >> Total Parameters in Reference Model: {sum(p.numel() for p in reference_model.parameters())}")
