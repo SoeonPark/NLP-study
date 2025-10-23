@@ -241,7 +241,7 @@ class GRPOSampler:
             - Provide a richer set of samples for better reward signal estimation.
     """
     def __init__(self, model: nn.Module, reference_model: nn.Module, tokenizer: AutoTokenizer,
-                 group_size: int = 5, temperature: float = 1.0,
+                 group_size: int = 4, temperature: float = 1.0,
                  top_k: int = 50, top_p: float = 0.95):
         self.model = model # Policy Model
         self.reference_model = reference_model # Frozen Reference Model (for KL penalty)
@@ -566,7 +566,7 @@ class GRPOSampler:
             input_length = input_ids.size(1)
         ) # (batch_size, group_size, target_seq_len), (batch_size, group_size, target_seq_len)
 
-        # breakpoint()s
+        # breakpoint()
         """
             Debug Remark:
                 (Pdb) log_probs.shape
@@ -690,8 +690,11 @@ class GRPOSampler:
             generated_end_index = total_seq_len - 1
             logits_to_keep = generated_end_index - generated_start_index + 1
 
-            generated_log_probs = token_log_probs[:, generated_start_index:generated_end_index] # (batch_size, logits_to_keep)
-            ref_generated_log_probs = ref_token_log_probs[:, generated_start_index:generated_end_index] # (batch_size, logits_to_keep)
+            generated_log_probs = token_log_probs[:, generated_start_index:generated_end_index + logits_to_keep] # (batch_size, logits_to_keep)
+            ref_generated_log_probs = ref_token_log_probs[:, generated_start_index:generated_end_index + logits_to_keep] # (batch_size, logits_to_keep)
+
+            # generated_log_probs = token_log_probs[:, input_length-1:total_seq_len-1] # (batch_size, logits_to_keep)
+            # ref_generated_log_probs = ref_token_log_probs[:, input_length-1:total_seq_len-1] # (batch_size, logits_to_keep)
 
             all_log_probs.append(generated_log_probs)
             all_ref_log_probs.append(ref_generated_log_probs)
@@ -730,7 +733,7 @@ class ROUGERewardCalculator:
 
     # 2.1 ROUGE Reward Calculation
     def compute_rewards(self, generated_summaries: List[str],
-                        reference_summaries: List[str], group_size: int = 5) -> torch.Tensor:
+                        reference_summaries: List[str], group_size: int = 4) -> torch.Tensor:
         """
             Compute ROUGE Rewards for each generated summary.
 
@@ -796,12 +799,13 @@ class GRPOLossCalculator:
         Compute GRPO Loss using Group-Relative Advantages.
         Loss = - Σ (advantage * log_prob)
     """
-    def __init__(self, beta: float = 0.1):
+    def __init__(self, beta: float = 0.1, clip_epsilon: float = 0.2):
         """
             Args: 
                 - beta: scaling factor for advantages
         """
         self.beta = beta
+        self.clip_epsilon = clip_epsilon
 
     def compute_loss(self, 
                      log_probs: torch.Tensor, 
@@ -838,6 +842,10 @@ class GRPOLossCalculator:
         else:
             sequence_log_probs = log_probs.sum(dim=-1) # (batch_size, group_size)
 
+        # Ratio Clipping
+        ratio = torch.exp(sequence_log_probs - ref_log_probs.sum(dim=-1)) # (batch_size, group_size)
+        clipped_ratio = torch.clamp(ratio, 1-self.clip_epsilon, 1+self.clip_epsilon)
+
         # Policy Gradient Loss Calculation
         # >> Equation: - \Sum [Advantage * log_prob] <<
         policy_gradient_loss = -(advantages * sequence_log_probs).mean() # Mean over batch and group
@@ -867,99 +875,12 @@ class GRPOLossCalculator:
 
         return total_loss, metrics
     
-# ADDITIONAL
-def print_token_details(generated_ids, log_probs, tokenizer, 
-                        batch_idx=0, sample_idx=0, num_tokens=10):
-
-    print("\n" + "="*80)
-    print(f"TOKEN DETAILS - Batch {batch_idx}, Sample {sample_idx}")
-    print("="*80)
-    
-    tokens = generated_ids[batch_idx, sample_idx]
-    token_lps = log_probs[batch_idx, sample_idx]
-    
-    non_pad_mask = tokens != tokenizer.pad_token_id
-    non_pad_tokens = tokens[non_pad_mask][:num_tokens]
-    non_pad_lps = token_lps[:len(non_pad_tokens)]
-    
-    print(f"\n{'Idx':<5} {'Token ID':<10} {'Token Text':<20} {'Log Prob':<12} {'Prob':<10}")
-    print("-"*80)
-    
-    for i, (token_id, lp) in enumerate(zip(non_pad_tokens, non_pad_lps)):
-        token_text = tokenizer.decode([token_id.item()])
-        prob = torch.exp(lp).item()
-        print(f"{i:<5} {token_id.item():<10} {token_text:<20} {lp.item():<12.6f} {prob:<10.6f}")
-    
-    print("="*80 + "\n")
-
-
-def verify_log_probs(model, generated_ids, log_probs, input_length, tokenizer,
-                     batch_idx=0, sample_idx=0, num_check=5):
-
-    print("\n" + "="*80)
-    print(f"LOG PROB VERIFICATION - Batch {batch_idx}, Sample {sample_idx}")
-    print("="*80)
-    
-    model.eval()
-    
-    curr_seq = generated_ids[batch_idx, sample_idx, :]
-    
-    with torch.no_grad():
-        outputs = model(input_ids=curr_seq.unsqueeze(0))
-        logits = outputs.logits.squeeze(0)
-        calculated_log_probs = F.log_softmax(logits, dim=-1)
-    
-    generated_tokens = curr_seq[input_length:]
-    
-    print(f"\n{'Pos':<5} {'Token':<15} {'Manual':<12} {'Stored':<12} {'Diff':<12} {'Match'}")
-    print("-"*80)
-    
-    for i in range(min(num_check, len(generated_tokens))):
-        logit_pos = input_length + i - 1
-        token_id = generated_tokens[i].item()
-        
-        if token_id == tokenizer.pad_token_id:
-            continue
-        
-        manual = calculated_log_probs[logit_pos, token_id].item()
-        stored = log_probs[batch_idx, sample_idx, i].item()
-        diff = abs(manual - stored)
-        match = "O" if diff < 1e-4 else "X"
-        
-        token_text = tokenizer.decode([token_id])
-        print(f"{i:<5} {token_text:<15} {manual:<12.6f} {stored:<12.6f} {diff:<12.8f} {match}")
-    
-    model.train()
-    print("="*80 + "\n")
-
-def verify_gradients(model, loss):
-    print("\n" + "="*80)
-    print("GRADIENT VERIFICATION")
-    print("="*80)
-    
-    has_grad = False
-    max_grad = 0.0
-    min_grad = float('inf')
-
-    for name, param in model.named_parameters():
-        if param.requires_grad and param.grad is not None:
-            has_grad = True
-            param_max = param.grad.norm().item()
-            max_grad = max(max_grad, param_max)
-            min_grad = min(min_grad, param_max)
-
-            if 'lora' in name.lower():
-                print(f"Param: {name}, Grad Norm: {param_max:.6f}")
-
-    print(f"\nOverall Grad Norms - {has_grad} Max: {max_grad:.6f}, Min: {min_grad:.6f}")
-
-    return has_grad
 
 # 4. Main Training Script Structure (Training Loop)
 def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: DataLoader, 
                optimizer: torch.optim.Optimizer, device: torch.device,
                tokenizer: AutoTokenizer, epoch: int = 3,
-               group_size: int = 5, temperature: float = 1.0,
+               group_size: int = 4, temperature: float = 1.0,
                beta: float = 0.1) -> Dict[str, float]:
     """
         Train the model using GRPO method.
@@ -1015,7 +936,7 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
         # generated_ids: (batch_size, group_size, total_seq_len)
         # log_probs: (batch_size, group_size, logits_to_keep)
         batch_size, group_size, total_seq_len = generated_ids.size()
-        # logits_to_keep = total_seq_len - input_ids.size(1)
+        logits_to_keep = log_probs.size(2)
 
         # breakpoint()
         
@@ -1063,7 +984,9 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
 
         # 5. Compute GRPO Loss
         # Firstly, Create attention mask for generated sequences
-        attention_mask_for_generation = (generated_ids[:, :, input_ids.size(1):] != tokenizer.pad_token_id).float()
+        attention_mask_for_generation = (
+            generated_ids[:, :, -logits_to_keep:] != tokenizer.pad_token_id
+        ).float() # (batch_size, group_size, logits_to_keep)
 
         loss, metrics = loss_calculator.compute_loss(
             log_probs = log_probs,
@@ -1075,10 +998,10 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
         # Backpropagation and Optimization
         optimizer.zero_grad()
         loss.backward()
-        if step == 0:
-            has_grad = verify_gradients(model, loss)
-            if not has_grad:
-                raise ValueError("No gradients found in the model parameters.")
+        # if step == 0:
+        #     has_grad = verify_gradients(model, loss)
+        #     if not has_grad:
+        #         raise ValueError("No gradients found in the model parameters.")
             
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Gradient Clipping
         optimizer.step()
@@ -1150,7 +1073,7 @@ def evaluate_grpo(model: nn.Module,
                   reference_model: nn.Module, 
                   dataloader: DataLoader,
                   device: torch.device, tokenizer: AutoTokenizer,
-                  group_size: int = 5) -> Dict[str, Any]:
+                  group_size: int = 4) -> Dict[str, Any]:
     model.eval()
     sampler = GRPOSampler(model, reference_model, tokenizer, group_size, temperature=0.7)
     reward_calculator = ROUGERewardCalculator()
@@ -1168,7 +1091,7 @@ def evaluate_grpo(model: nn.Module,
             reference_summaries = batch['summaries']  # List of strings
 
             # 1. Generate group samples
-            generated_ids, _ = sampler.generate_group_samples(
+            generated_ids, _, _ = sampler.generate_group_samples(
                 input_ids = input_ids,
                 attention_mask = attention_mask,
                 max_new_tokens = 32
@@ -1255,7 +1178,7 @@ def grpo_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Di
             # For pure input preparation (as in the original Llama function):
         ]
         message_list.append(messages)
-
+    
     # Format Inputs of model with 'apply_chat_template'
     formatted_inputs = [
         tokenizer.apply_chat_template(
@@ -1282,8 +1205,8 @@ def grpo_collate_fn(batch: List[Dict[str, Any]], tokenizer: AutoTokenizer) -> Di
     tokenizer.padding_side = original_padding_side  # Restore original padding side
     
     return {
-        "input_ids": inputs.input_ids,
-        "attention_mask": inputs.attention_mask,
+        "input_ids": inputs['input_ids'],
+        "attention_mask": inputs['attention_mask'],
         "summaries": summaries # Still keep as strings for evaluation, reward calculation
     }
     
@@ -1356,9 +1279,12 @@ def main():
     print(" >> Setting up 4-bit Quantization and Preparing Model for LoRA + GRPO...")
     bnb_config = BitsAndBytesConfig(
         load_in_8bit = True,
-        bnb_4bit_use_double_quant = True,
-        bnb_4bit_quant_type = 'nf4',
-        bnb_4bit_compute_type = torch.float16
+        bnb_8bit_quant_type = 'nf4',
+        bnb_8bit_compute_type = torch.float16,
+        bnb_8bit_use_double_quant = True,
+        # bnb_4bit_use_double_quant = True,
+        # bnb_4bit_quant_type = 'nf4',
+        # bnb_4bit_compute_type = torch.float16
     )
 
     # Policy Model with LoRA
