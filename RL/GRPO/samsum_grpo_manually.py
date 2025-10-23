@@ -312,6 +312,9 @@ class GRPOSampler:
                     # Note: return_dict_in_generate=False to get only generated_ids
                     use_cache = True
                 )
+                # generated_outputs: (batch_size, logits_to_keep)
+                all_generated_ids.append(generated_outputs)
+                max_length = max(max_length, generated_outputs.size(1))
 
         # # Generate K size of samples
         # for k in range(self.group_size):
@@ -391,9 +394,9 @@ class GRPOSampler:
                             torch.Size([1, 50257])
                     ```
                 """
-                # generated_outputs: (batch_size, logits_to_keep)
-            all_generated_ids.append(generated_outputs)
-            max_length = max(max_length, generated_outputs.size(1))
+            #     # generated_outputs: (batch_size, logits_to_keep)
+            # all_generated_ids.append(generated_outputs)
+            # max_length = max(max_length, generated_outputs.size(1))
 
         # breakpoint()
         """
@@ -550,9 +553,11 @@ class GRPOSampler:
 
         # Stack generated ids: (batch_size, group_size, target_seq_len)
         generated_ids = torch.stack(padded_ids, dim=1) # dim=1 for group_size
+        # breakpoint()
 
         # When computing log probs, need model in train mode for gradient checkpointing
         self.model.train()
+        # breakpoint()
 
         # Compute log probabilities for each generated sequence -- for generated part only
         # log_probs = self._compute_log_probs(generated_ids, input_ids.size(1)) # (batch_size, group_size, target_seq_len)
@@ -561,7 +566,7 @@ class GRPOSampler:
             input_length = input_ids.size(1)
         ) # (batch_size, group_size, target_seq_len), (batch_size, group_size, target_seq_len)
 
-        # breakpoint()
+        # breakpoint()s
         """
             Debug Remark:
                 (Pdb) log_probs.shape
@@ -1026,10 +1031,10 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
             generated_texts_2d.append(batch_samples)
 
         # Flatten generated_texts_2d for reward computation
-        generated_text = [text for batch_samples in generated_texts_2d for text in batch_samples]
+        generated_texts = [text for batch_samples in generated_texts_2d for text in batch_samples]
 
         rewards = reward_calculator.compute_rewards(
-            generated_summaries = generated_text,
+            generated_summaries = generated_texts,
             reference_summaries = reference_summaries,
             group_size = group_size
         ).to(device) # (batch_size, group_size)
@@ -1082,7 +1087,7 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module, dataloader: D
         total_reward += rewards.mean().item()
         total_policy_gradient_loss += metrics['policy_gradient_loss']
         total_kl_divergence += metrics['kl_divergence']
-
+         
         if (step + 1) % 1 == 0:
             print(f" >> Step [{step+1}/{len(dataloader)}], Loss: {loss.item():.4f}, Avg Reward: {rewards.mean().item():.4f}")
             display_batch_index = 0
@@ -1442,7 +1447,7 @@ def main():
             dataloader = grpo_train_loader,
             optimizer = grpo_optimizer,
             device = device,
-            group_size = int(grop_config["grop_group_size"]),
+            group_size = grop_config["grop_group_size"],
             temperature = grop_config["grop_temperature"],
             beta = grop_config["grop_beta"]
         )
