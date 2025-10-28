@@ -209,7 +209,8 @@ class GRPOSampler:
                     top_p = self.top_p,
                     pad_token_id = self.tokenizer.eos_token_id,
                     eos_token_id = self.tokenizer.eos_token_id,
-                    return_dict_in_generate = False,
+                    # return_dict_in_generate = False,
+                    return_dict_in_generate = True, # Changed for getting scores -- use .sequences
                     output_scores = True,
                     use_cache = False
                 )
@@ -399,7 +400,7 @@ class GRPOLossCalculator:
         self.epsilon = epsilon
 
     def compute_loss(self, log_probs: torch.Tensor, 
-                     ref_log_probs: torch.Tensor,
+                     ref_log_probs: torch.Tensor, old_log_probs: torch.Tensor,
                      advantages: torch.Tensor,
                      attention_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -424,45 +425,42 @@ class GRPOLossCalculator:
         advantages = advantages.float()
         attention_mask = attention_mask.float()
 
-        token_counts = attention_mask.sum()
+        # Count for valid tokens
+        token_counts = attention_mask.sum(dim=-1)
+        total_token = token_counts.sum()
+
         if token_counts.item() == 0:
              return torch.tensor(0.0, device=log_probs.device), {'total_loss': 0.0, 'policy_loss': 0.0, 'kl_divergence': 0.0, 'mean_advantage': 0.0, 'std_advantage': 0.0}
 
-        # 1. Per-token probabilities
-        kl_per_token = log_probs - ref_log_probs  # (batch_size, group_size, seq_len)
-        masked_kl = kl_per_token * attention_mask # Make sure the shape of attention_mask is (batch_size, 1, seq_len) for broadcasting
+        # 1. Sampling Ratio: \pi_{new}(a|s) / \pi_{old}(a|s)
+        ratio_per_token = torch.exp(log_probs - old_log_probs)  # (batch_size, group_size, seq_len)
 
-        # Normalize by number of valid tokens
-        # token_counts = attention_mask.sum(dim=-1) # (batch_size, group_size)
-        
-        kl_divergence = masked_kl.sum(dim=-1) / (token_counts + 1e-8)
-        kl_divergence = kl_divergence.mean()  # Average over batch and group_size
+        # 2. Expand advantages for per-token multiplication
+        advantages_expanded = advantages.unsqueeze(-1)  # (batch_size, group_size, 1)
 
-        # 2. Policy Gradient Loss with per-token advantages
-        ratio = torch.exp(log_probs - old_log_probs)  # (batch_size, group_size, seq_len)
-        # Broadcast attention_mask to (batch_size, group_size, seq_len)
-        advantages_expanded = advantages.unsqueeze(-1) #.expand_as(log_probs)  # (batch_size, group_size, seq_len)
+        # PPO based clipped objective
         # 2-1. Policy Gradient Loss 1: Unclipped
-        surrogate_objective_unclipped = ratio * advantages_expanded  # (batch_size, group_size, seq_len)
+        surrogate_objective_unclipped = ratio_per_token * advantages_expanded  # (batch_size, group_size, seq_len)
 
         # 2-2. Policy Gradient Loss 2: Clipped
         # Clip the surrogate objective (ratio, 1-epsilon, 1+epsilon) * A
         surrogate_objective_clipped = torch.clamp(
-            ratio,
-            1 - self.epsilon,
-            1 + self.epsilon
+            ratio_per_token,
+            1.0 - self.epsilon,
+            1.0 + self.epsilon
         ) * advantages_expanded
 
         # 2-3. Final per-token objective
         per_token_objective = torch.min(surrogate_objective_unclipped, surrogate_objective_clipped)
-        # per_token_loss = - advantages_expanded * log_probs # (batch_size, group_size, seq_len)
-        per_token_loss = - per_token_objective  # (batch_size, group_size, seq_len)
 
-        # Mask and Normalize by total number of tokens
-        masked_loss = per_token_loss * attention_mask #.unsqueeze(-2) # (batch_size, group_size, seq_len)
-        policy_loss = masked_loss.sum() / (token_counts + 1e-8)
+        # Apply mask and compute policy loss
+        masked_policy_gradient_loss = - per_token_objective * attention_mask  # (batch_size, group_size, seq_len)
+        policy_loss = masked_policy_gradient_loss.sum() / total_token
+        
+        kl_divergence_per_token = log_probs - ref_log_probs  # (batch_size, group_size, seq_len)
+        masked_kl_divergence = kl_divergence_per_token * attention_mask  # (batch_size, group_size, seq_len)
+        kl_divergence = masked_kl_divergence.sum() / total_token
 
-        # 3. KL Divergence Penalty
         total_loss = policy_loss + self.beta * kl_divergence
 
         # Metrics Dictionary
@@ -509,13 +507,13 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
         reference_summaries = batch["summaries"]
 
         # 1. Generate group samples
-        generated_ids, log_probs, ref_log_probs = sampler.generate_group_samples(
+        generated_ids, old_log_probs, log_probs, ref_log_probs = sampler.generate_group_samples(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=32
         )
 
-        batch_size, group_size, total_seq_len = generated_ids.size()
+        batch_size, group_size, _ = generated_ids.size() # (batch_size, group_size, seq_len)
         gen_seq_len = log_probs.size(2)
 
         # 2. Decode and compute rewards
@@ -547,6 +545,7 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
         # 5. Compute GRPO loss (TRL-style)
         loss, metrics = loss_calculator.compute_loss(
             log_probs=log_probs,
+            old_log_probs=old_log_probs,
             ref_log_probs=ref_log_probs,
             advantages=advantages,
             attention_mask=attention_mask_gen
@@ -619,7 +618,7 @@ def evaluate_grpo_llama(model: nn.Module, reference_model: nn.Module,
                 attention_mask=attention_mask,
                 max_new_tokens=32
             )
-            batch_size, group_size, total_seq_len = generated_ids.size()
+            batch_size, group_size, _ = generated_ids.size() # (batch_size, group_size, seq_len)
 
             generated_texts = []
             for batch_idx in range(batch_size):
@@ -794,6 +793,7 @@ def main():
         "epsilon": 0.2,
         "top_k": 50,
         "top_p": 0.9,
+        "steps_per_generation": 1
     }
 
     for key, value in grpo_config.items():
