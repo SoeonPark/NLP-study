@@ -181,18 +181,21 @@ class GRPOSampler:
             
             Returns:
                 - generated_ids: Tensor of shape (batch_size, group_size, seq_len)
-                - log_probs: Tensor of shape (batch_size, group_size, seq_len)
-                - ref_log_probs: Tensor of shape (batch_size, group_size, seq_len)
+                - old_log_probs: Tensor of shape (batch_size, group_size, gen_len) - from generation
+                - log_probs: Tensor of shape (batch_size, group_size, seq_len) - current policy
+                - ref_log_probs: Tensor of shape (batch_size, group_size, seq_len) - reference policy
         """
-        self.model.eval()
+        # self.model.eval()
         batch_size = input_ids.size(0)
         device = input_ids.device
 
         model_to_use = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
         all_generated_ids = [] 
+        all_old_log_probs = []
         max_length = 0
 
+        model_to_use.eval()
         # Generate K Samples
         with torch.no_grad():
             for k in range(self.group_size):
@@ -207,14 +210,33 @@ class GRPOSampler:
                     pad_token_id = self.tokenizer.eos_token_id,
                     eos_token_id = self.tokenizer.eos_token_id,
                     return_dict_in_generate = False,
+                    output_scores = True,
                     use_cache = False
                 )
-                all_generated_ids.append(generated_outputs)
-                max_length = max(max_length, generated_outputs.size(1))
-        
+                # Extract generated sequences
+                gen_sequences = generated_outputs.sequences  # (batch_size, seq_len)
+                all_generated_ids.append(gen_sequences)
+                max_length = max(max_length, gen_sequences.size(1))
+
+                # Compute old log probs during generation
+                old_log_probs = []
+                for index, score in enumerate(generated_outputs.scores):
+                    # Score shape: (batch_size, vocab_size)
+                    log_probs_step = F.log_softmax(score, dim=-1)
+                    # Get the log probs of the generated tokens at this step
+                    selected_token = gen_sequences[:, input_ids.size(1) + index]  # (batch_size,)
+                    token_log_probs = log_probs_step.gather(1, selected_token.unsqueeze(-1)).squeeze(-1)  # (batch_size,)
+                    old_log_probs.append(token_log_probs)
+
+                if old_log_probs:
+                    old_log_probs = torch.stack(old_log_probs, dim=1)  # (batch_size, gen_len)
+                    all_old_log_probs.append(old_log_probs)
+
         # Pad all sequences to max_length
         padded_ids = []
-        for generate_idx in all_generated_ids:
+        padded_old_log_probs = []
+    
+        for generate_idx, old_lp in zip(all_generated_ids, all_old_log_probs):
             if generate_idx.size(1) < max_length:
                 padding = torch.full(
                     (generate_idx.size(0), max_length - generate_idx.size(1)),
@@ -225,8 +247,22 @@ class GRPOSampler:
                 generate_idx = torch.cat([generate_idx, padding], dim=1)
             padded_ids.append(generate_idx)
 
+            # Pad old log probs with zeros
+            gen_len = old_lp.size(1)
+            target_gen_len = max_length - input_ids.size(1)
+            if gen_len < target_gen_len:
+                padding = torch.zeros(
+                    (old_lp.size(0), target_gen_len - gen_len),
+                    dtype=old_lp.dtype,
+                    device=device
+                )
+                old_lp = torch.cat([old_lp, padding], dim=1)
+            padded_old_log_probs.append(old_lp)
+
         generated_ids = torch.stack(padded_ids, dim=1)  # (batch_size, group_size, seq_len)
-        self.model.train()
+        old_log_probs = torch.stack(padded_old_log_probs, dim=1)  # (batch_size, group_size, gen_len)
+
+        model_to_use.train()
 
         # Compute Log Probabilities in batched manner (which TRL does)
         log_probs, ref_log_probs = self._compute_log_probs(
@@ -234,7 +270,7 @@ class GRPOSampler:
             input_length = input_ids.size(1)
         )
 
-        return generated_ids, log_probs, ref_log_probs
+        return generated_ids, old_log_probs, log_probs, ref_log_probs
 
     def _compute_log_probs(self, generated_ids: torch.Tensor, input_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -381,8 +417,10 @@ class GRPOLossCalculator:
                     - avg_kl_divergence: Average KL divergence across the batch.
                     - avg_policy_loss: Average policy loss across the batch.    
         """
-        lob_probs = log_probs.float() 
+        log_probs = log_probs.float() 
+        old_log_probs = old_log_probs.float()
         ref_log_probs = ref_log_probs.float()
+        
         advantages = advantages.float()
         attention_mask = attention_mask.float()
 
@@ -401,11 +439,13 @@ class GRPOLossCalculator:
         kl_divergence = kl_divergence.mean()  # Average over batch and group_size
 
         # 2. Policy Gradient Loss with per-token advantages
-        ratio = torch.exp(log_probs - ref_log_probs)  # (batch_size, group_size, seq_len)
+        ratio = torch.exp(log_probs - old_log_probs)  # (batch_size, group_size, seq_len)
         # Broadcast attention_mask to (batch_size, group_size, seq_len)
-        advantages_expanded = advantages.unsqueeze(-1).expand_as(log_probs)  # (batch_size, group_size, seq_len)
+        advantages_expanded = advantages.unsqueeze(-1) #.expand_as(log_probs)  # (batch_size, group_size, seq_len)
+        # 2-1. Policy Gradient Loss 1: Unclipped
         surrogate_objective_unclipped = ratio * advantages_expanded  # (batch_size, group_size, seq_len)
 
+        # 2-2. Policy Gradient Loss 2: Clipped
         # Clip the surrogate objective (ratio, 1-epsilon, 1+epsilon) * A
         surrogate_objective_clipped = torch.clamp(
             ratio,
@@ -413,6 +453,7 @@ class GRPOLossCalculator:
             1 + self.epsilon
         ) * advantages_expanded
 
+        # 2-3. Final per-token objective
         per_token_objective = torch.min(surrogate_objective_unclipped, surrogate_objective_clipped)
         # per_token_loss = - advantages_expanded * log_probs # (batch_size, group_size, seq_len)
         per_token_loss = - per_token_objective  # (batch_size, group_size, seq_len)
