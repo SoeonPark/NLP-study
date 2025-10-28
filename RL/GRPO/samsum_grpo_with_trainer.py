@@ -65,7 +65,6 @@ class GRPOConfig:
 
     # Params that Control Generation
     generation_batch_size: int = field(default = 2, metadata = {"help": "Batch size for generation"})
-    steps_per_generation: int = field(default = 4, metadata = {"help": "Number of optimization steps per generation"})
     temperature: float = field(default = 1.0, metadata = {"help": "Temperature for sampling"})
     top_k: int = field(default = 0, metadata = {"help": "Top-k sampling parameter"})
     top_p: float = field(default = 0.9, metadata = {"help": "Top-p sampling parameter"})
@@ -98,16 +97,16 @@ class ROUGERewardCalculator:
         for pred, ref in zip(predictions, reference_list):
             result = self.rouge.compute(predictions=[pred], references=[ref], use_stemmer=True)
             if self.use_rouge_1:
-                scores.append(result['rouge1'])
+                score = result['rouge1']
             if self.use_rouge_l:
-                scores.append(result['rougeL'])
+                score = result['rougeL']
             elif self.use_rouge_1 and self.use_rouge_l:
-                scores.append((result['rouge1'] + result['rougeL']) / 2.0)
+                score = (result['rouge1'] + result['rougeL']) / 2.0
             else:
                 raise ValueError("At least one of use_rouge_1 or use_rouge_l must be True.")
-            scores.append(scores)
+            scores.append(score)
 
-        rewards = torch.tensor(rewards, dtype=torch.float32).view(batch_size, group_size)
+        rewards = torch.tensor(scores, dtype=torch.float32).view(batch_size, group_size)
         return rewards
     
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
@@ -133,8 +132,13 @@ class GRPOTrainer(Trainer):
                          data_collator=data_collator)
 
         self.ref_model = ref_model
+        self.ref_model.eval()
+
         self.grpo_config = grpo_config
         self.reward_calculator = ROUGERewardCalculator()
+
+        for param in self.ref_model.parameters():
+            param.requires_grad = False
 
     def _get_train_dataloader(self):
 
@@ -158,7 +162,36 @@ class GRPOTrainer(Trainer):
 
     def _generate_and_score_completions(self, ) -> Dict[str, Union[torch.Tensor, Any]]:
 
-    def _compute_loss(self, model: nn.Module, inputs: Dict[str, Any], return_outputs: bool = False) -> torch.Tensor: = os.path.join(load_directory, model_name)
+    def _compute_loss(self, model: nn.Module, inputs: Dict[str, Any], return_outputs: bool = False) -> torch.Tensor:
+        """
+            GRPO Loss Computation
+
+        """
+        # -- 1. Generate and Score Completions --
+        gen_data = self._generate_and_score_completions(inputs)
+
+        # -- 2. Current Policy Log Probabilities and Entropies --
+        logits = model(
+            gen_data["generated_ids"],
+            attention_mask=gen_data["generated_attention_mask"],
+        ).logits
+        log_probs, entropies = self._get_per_token_logps_and_entropies(
+            logits,
+            gen_data["generated_ids"],
+            gen_data["generated_attention_mask"],
+        )
+
+        # -- 3. GRPO Loss Computation --
+        # Ratio = exp(log \pi(a|s) - log \pi_ref(a|s))
+        ratios = torch.exp(log_probs - gen_data["ref_log_probs"]) # (batch_size, num_generations, seq_len)
+        # Policy Loss Component
+        policy_loss = - (ratios * gen_data["advantages"]).mean()
+        # KL Divergence Loss Component
+        kl_loss = (log_probs - gen_data["ref_entropies"]).mean()
+
+        loss = policy_loss + self.grpo_config.beta * kl_loss
+
+        return (loss, outputs) if return_outputs else loss
 
 # Main Function using Trainer
 def main():
@@ -186,14 +219,26 @@ def main():
         num_iterations=1,
     )
 
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.1,
+    )
+
     model_name = "meta-llama/Llama-3.2-3B-Instruct"
     model, tokenizer = load_model_and_tokenizer(
+        load_directory="./pretrained_models", model_name=model_name, use_peft=True, 
+        peft_config=lora_config
     )
 
     # Prepare reference model
     ref_model, _ = load_model_and_tokenizer(
-        load_directory="./pretrained_models", model_name..)
-    
+        load_directory="./pretrained_models", model_name=model_name, use_peft=True,
+        peft_config=lora_config
+    )
+
     # Prepare dataset
     print(" >> Loading SAMSum Dataset...")
     dataset = load_dataset("knkarthick/samsum")
