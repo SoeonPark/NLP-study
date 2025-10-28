@@ -13,10 +13,13 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 import evaluate
 from pathlib import Path
-import tqdm
+from tqdm import tqdm
 import torch.nn.functional as F
 
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
+
+from trl.trainer.utils import RepeatSampler
+
 # from transformers import Trainer, TrainingArguments # Not used Version
 
 """
@@ -355,8 +358,9 @@ class GRPOLossCalculator:
             - Per-token loss computation with masking.
             - KL Divergence penalty to maintain alignment with the reference model.
     """
-    def __init__(self, beta: float = 0.1):
+    def __init__(self, beta: float = 0.1, epsilon: float = 0.2):
         self.beta = beta
+        self.epsilon = epsilon
 
     def compute_loss(self, log_probs: torch.Tensor, 
                      ref_log_probs: torch.Tensor,
@@ -382,24 +386,40 @@ class GRPOLossCalculator:
         advantages = advantages.float()
         attention_mask = attention_mask.float()
 
+        token_counts = attention_mask.sum()
+        if token_counts.item() == 0:
+             return torch.tensor(0.0, device=log_probs.device), {'total_loss': 0.0, 'policy_loss': 0.0, 'kl_divergence': 0.0, 'mean_advantage': 0.0, 'std_advantage': 0.0}
+
         # 1. Per-token probabilities
         kl_per_token = log_probs - ref_log_probs  # (batch_size, group_size, seq_len)
         masked_kl = kl_per_token * attention_mask # Make sure the shape of attention_mask is (batch_size, 1, seq_len) for broadcasting
 
         # Normalize by number of valid tokens
-        token_counts = attention_mask.sum(dim=-1) # (batch_size, group_size)
+        # token_counts = attention_mask.sum(dim=-1) # (batch_size, group_size)
+        
         kl_divergence = masked_kl.sum(dim=-1) / (token_counts + 1e-8)
         kl_divergence = kl_divergence.mean()  # Average over batch and group_size
 
         # 2. Policy Gradient Loss with per-token advantages
+        ratio = torch.exp(log_probs - ref_log_probs)  # (batch_size, group_size, seq_len)
         # Broadcast attention_mask to (batch_size, group_size, seq_len)
-        advantages_expanded = advantages.unsqueeze(-1)  # (batch_size, group_size, 1)
+        advantages_expanded = advantages.unsqueeze(-1).expand_as(log_probs)  # (batch_size, group_size, seq_len)
+        surrogate_objective_unclipped = ratio * advantages_expanded  # (batch_size, group_size, seq_len)
 
-        per_token_loss = - advantages_expanded * log_probs # (batch_size, group_size, seq_len)
+        # Clip the surrogate objective (ratio, 1-epsilon, 1+epsilon) * A
+        surrogate_objective_clipped = torch.clamp(
+            ratio,
+            1 - self.epsilon,
+            1 + self.epsilon
+        ) * advantages_expanded
+
+        per_token_objective = torch.min(surrogate_objective_unclipped, surrogate_objective_clipped)
+        # per_token_loss = - advantages_expanded * log_probs # (batch_size, group_size, seq_len)
+        per_token_loss = - per_token_objective  # (batch_size, group_size, seq_len)
 
         # Mask and Normalize by total number of tokens
-        masked_loss = per_token_loss * attention_mask  # (batch_size, group_size, seq_len)
-        policy_loss = masked_loss.sum() / (attention_mask.sum() + 1e-8)
+        masked_loss = per_token_loss * attention_mask #.unsqueeze(-2) # (batch_size, group_size, seq_len)
+        policy_loss = masked_loss.sum() / (token_counts + 1e-8)
 
         # 3. KL Divergence Penalty
         total_loss = policy_loss + self.beta * kl_divergence
@@ -420,7 +440,7 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
                      tokenizer: AutoTokenizer, dataloader: DataLoader,
                      optimizer: torch.optim.Optimizer, device: torch.device,
                      num_epochs: int = 3, group_size: int = 4, 
-                     temperature: float = 1.0, beta: float = 0.1) -> Dict[str, List[float]]:
+                     temperature: float = 1.0, beta: float = 0.1, epoch: int = 0, epsilon: float = 0.2) -> Dict[str, List[float]]:
     model.train()
     reference_model.eval()
 
@@ -437,8 +457,11 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
         temperature = temperature
     )
     reward_calculator = ROUGERewardCalculator()
-    loss_calculator = GRPOLossCalculator(beta = beta)
+    loss_calculator = GRPOLossCalculator(beta = beta, epsilon = epsilon)
 
+    progress_bar = tqdm(range(len(dataloader)), desc=f"Training GRPO Epoch {epoch+1}/{num_epochs}", ncols=100)
+
+    # 
     for step, batch in enumerate(dataloader):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
@@ -596,7 +619,7 @@ def evaluate_grpo_llama(model: nn.Module, reference_model: nn.Module,
     all_rewards = torch.cat(all_rewards, dim=0)
 
     results = {
-        'mean_reward': all_rewards.mean().item(),
+        'avg_reward': all_rewards.mean().item(),
         'max_reward': all_rewards.max().item(),
         'min_reward': all_rewards.min().item(),
         'std_reward': all_rewards.std().item(),
@@ -710,6 +733,7 @@ def main():
     import copy
     reference_model = copy.deepcopy(model)
     reference_model = get_peft_model(reference_model, lora_config)
+    reference_model.gradient_checkpointing_disable()
     for param in reference_model.parameters():
         param.requires_grad = False # Freeze the reference model, which means no gradient computation.
     reference_model.eval()
@@ -726,6 +750,7 @@ def main():
         "learning_rate": 5e-5,
         "temperature": 0.7,
         "beta": 0.1,
+        "epsilon": 0.2,
         "top_k": 50,
         "top_p": 0.9,
     }
@@ -738,10 +763,21 @@ def main():
     train_dataset = dataset["train"].shuffle(seed=42)
     val_dataset = dataset["validation"].shuffle(seed=42)
 
+    # Use RepeatSampler
+    train_sampler = RepeatSampler(
+        data_source = train_dataset,
+        batch_size = grpo_config["batch_size"],
+        mini_repeat_count = grpo_config["group_size"],
+        shuffle = True,
+        repeat_count = grpo_config["steps_per_generation"],
+        seed = 42
+    )
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size = grpo_config["batch_size"],
-        shuffle = True,
+        batch_sampler = train_sampler,
+        batch_size = 1,
+        shuffle = False,
         collate_fn = lambda batch: grpo_collate_fn(batch, tokenizer)
     )
 
@@ -784,7 +820,8 @@ def main():
             num_epochs = grpo_config["num_epochs"],
             group_size = grpo_config["group_size"],
             temperature = grpo_config["temperature"],
-            beta = grpo_config["beta"]
+            beta = grpo_config["beta"],
+            epsilon= grpo_config["epsilon"],
         )
 
         print(f"\n >> Epoch {epoch + 1} Training Results:")
@@ -806,21 +843,20 @@ def main():
 
         print(f"\n >> Epoch {epoch + 1} Evaluation Results:")
         print(f"    - ROUGE-1: {eval_results['rouge1']:.4f}")
-        print(f"    - ROUGE-2: {eval_results['rouge2']:.4f}")
         print(f"    - ROUGE-L: {eval_results['rougeL']:.4f}")
-        print(f"   - Avg Reward: {eval_results['avg_reward']:.4f}")
-        print(f"   - Reward Std: {eval_results['reward_std']:.4f}")
+        print(f"    - Avg Reward: {eval_results['avg_reward']:.4f}")
+        print(f"    - Reward Std: {eval_results['reward_std']:.4f}")
 
         # Print Sample Summaries
-        print("\n >> Sample Summaries:")
-        if eval_results["samples"]:
-            print(f"    - Dialogue: {eval_results['samples'][0]['dialogue']}")
-            for i, sample in enumerate(eval_results["samples"]):
-                print(f"  [Generated Sample {i + 1}]")
-                print(f"    - Reference Summary: {sample['reference_summary']}")
-                print(f"    - Generated Summary: {sample['generated_summary']}\n")
-                # For every sample, print the reference and generated summary.
-                # NEED TO FIXX
+        # print("\n >> Sample Summaries:")
+        # if eval_results["samples"]:
+        #     print(f"    - Dialogue: {eval_results['samples'][0]['dialogue']}")
+        #     for i, sample in enumerate(eval_results["samples"]):
+        #         print(f"  [Generated Sample {i + 1}]")
+        #         print(f"    - Reference Summary: {sample['reference_summary']}")
+        #         print(f"    - Generated Summary: {sample['generated_summary']}\n")
+        #         # For every sample, print the reference and generated summary.
+        #         # NEED TO FIXX
 
         # Save Checkpoint
         metrics_dict = {
@@ -829,7 +865,6 @@ def main():
             "kl_divergence": train_metrics["avg_kl_divergence"],
             "policy_loss": train_metrics["avg_policy_loss"],
             "rouge1": eval_results["rouge1"],
-            "rouge2": eval_results["rouge2"],
             "rougeL": eval_results["rougeL"]
         }
         checkpoint_callback.on_epoch_end(epoch, metrics_dict, model)
