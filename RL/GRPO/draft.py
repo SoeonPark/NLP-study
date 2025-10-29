@@ -54,6 +54,8 @@ def load_model_and_tokenizer(model_name: str,
     """Load model and tokenizer"""
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
@@ -74,8 +76,7 @@ def load_model_and_tokenizer(model_name: str,
     
     # Apply PEFT
     if use_peft and peft_config is not None:
-        if use_8bit:
-            model = prepare_model_for_kbit_training(model)
+        model = prepare_model_for_kbit_training(model)
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
     
@@ -263,9 +264,9 @@ class GRPOTrainer(Trainer):
         self.ref_model = ref_model
         self.ref_model.eval()
         
-        # Freeze reference model
-        for param in self.ref_model.parameters():
-            param.requires_grad = False
+        # # Freeze reference model
+        # for param in self.ref_model.parameters():
+        #     param.requires_grad = False
         
         self.grpo_config = grpo_config
         
@@ -281,8 +282,8 @@ class GRPOTrainer(Trainer):
         self.epsilon_high = grpo_config.epsilon_high if grpo_config.epsilon_high is not None else grpo_config.epsilon
         
         # Enable gradient checkpointing if specified
-        if grpo_config.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable()
+        # if grpo_config.gradient_checkpointing:
+        #     self.model.gradient_checkpointing_enable()
 
     def _get_train_sampler(self, train_dataset=None) -> Optional[Sampler]:
         """Create custom sampler for GRPO training"""
@@ -740,7 +741,7 @@ def main():
         save_total_limit=2,
         learning_rate=1e-5,
         warmup_steps=100,
-        bf16=True,
+        fp16=True,
         gradient_checkpointing=True,
         remove_unused_columns=False,
         report_to="none",
