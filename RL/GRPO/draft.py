@@ -317,7 +317,38 @@ class GRPOTrainer(Trainer):
             if isinstance(value, torch.Tensor):
                 inputs[key] = value.to(self.args.device)
         return inputs
+    
+    def get_train_dataloader(self) -> DataLoader:
+        """
+        Returns the training [`~torch.utils.data.DataLoader`].
+        Overrides the Trainer's default method to set the correct batch size
+        for GRPO, which is (prompt_batch_size * num_generations).
+        """
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
 
+        train_dataset = self.train_dataset
+        data_collator = self.data_collator
+        
+        train_sampler = self._get_train_sampler(train_dataset)
+
+        # Calculate the true batch size
+        # self.args.per_device_train_batch_size is the PROMPT batch size
+        dataloader_batch_size = self.args.per_device_train_batch_size * self.grpo_config.num_generations
+
+        # Import DataLoader if it's not available in the scope
+        # from torch.utils.data import DataLoader
+        
+        return DataLoader(
+            train_dataset,
+            batch_size=dataloader_batch_size, # Use calculated batch size
+            sampler=train_sampler,
+            collate_fn=data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+    
     def _get_per_token_logps_and_entropies(
         self,
         logits: torch.Tensor,
@@ -520,7 +551,7 @@ class GRPOTrainer(Trainer):
             generated_ids,
             generated_mask,
             references,
-            prompt_lengths * self.grpo_config.num_generations
+            prompt_lengths # * self.grpo_config.num_generations
         )
         
         # Compute advantages
@@ -529,6 +560,8 @@ class GRPOTrainer(Trainer):
         # Expand advantages to match generation shape
         advantages_expanded = advantages.view(-1).unsqueeze(-1)  # (batch_size * num_generations, 1)
         advantages_expanded = advantages_expanded.expand(-1, generated_ids.size(1))  # Match seq_len
+        advantages_expanded = advantages_expanded.to(self.args.device)
+        rewards = rewards.to(self.args.device)
         
         # Compute reference model log probabilities
         with torch.no_grad():
