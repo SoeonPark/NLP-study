@@ -11,8 +11,8 @@ from transformers import Trainer, TrainingArguments
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_int8_training
 
 from datasets import load_dataset
-from dataclass import dataclass, field
-from typing import Optional, Iterator, List, Dict, Any, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Optional, Iterator, List, Dict, Any, Sized, Tuple, Union
 
 from torch.utils.data import DataLoader, Sampler
 from torch.optim import AdamW
@@ -55,7 +55,33 @@ def load_model_and_tokenizer(load_directory: str, model_name: str,
 
     return model, tokenizer
 
-class CheckpointCallback
+class RepeatSampler(Sampler):
+    """
+        Sampler that repeats each data point 'num_repeats' times.
+    """
+    def __init__(self, data_source: Sized, mini_repeat_count: int, repeat_count: int = 1,
+                 batch_size: int = 1, shuffle: bool = True, seed: int = 42):
+        self.data_source = data_source
+        self.mini_repeat_count = mini_repeat_count
+        self.repeat_count = repeat_count
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+
+        self.num_samples = len(data_source)
+
+        if self.shuffle:
+            self.generator = torch.Generator() # Create a local random generator
+            if seed is not None:
+                self.generator.manual_seed(seed)
+
+    def __iter__(self):
+        if self.shuffle:
+            # Generate Shuffled Indices
+            indexes = torch.randperm(self.num_samples, generator=self.generator).tolist()
+            # Repeat Each Index 'mini_repeat_count' Times
+        else:
+            indexes = list(range(self.num_samples))
 
 class GRPOConfig:
     # Params that Control the Data Preprocessing
@@ -144,13 +170,62 @@ class GRPOTrainer(Trainer):
 
     def _get_train_sampler(self) -> Optional[Sampler]:
 
-    def _repeat_sampler(self, dataset: torch.utils.data.Dataset) -> Iterator[int]:
-
     def _get_eval_sampler(self, eval_dataset: Optional[torch.utils.data.Dataset] = None) -> Optional[Sampler]:
 
     def _get_high_entropy_mask(self, entropies: torch.Tensor, mask: torch.Tensor, threshold: float) -> torch.Tensor:
+        """
+            High Entropy Masking
 
-    def _get_per_token_logps_and_entropies(self, )
+            Args:
+                - entropies (torch.Tensor): Per-token entropies of shape (batch_size, seq_len)
+                - mask (torch.Tensor): Attention mask of shape (batch_size, seq_len)
+                - threshold (float): Entropy threshold for masking
+
+            Returns:
+                - high_entropy_mask (torch.Tensor): Binary mask indicating high-entropy tokens of shape (batch_size, seq_len)
+        """
+        local = entropies[mask.bool()].float()
+
+        pad_value = -1e9
+
+        # Pad across processes so that every rank has the same number of tokens
+        padded = self.accelerator.pad_across_processes(local, dim=0, pad_value=pad_value)
+        gathered = self.accelerator.gather(padded)
+
+        # Drop sentinel Values 
+        gathered = gathered[gathered != pad_value]
+
+        if gathered.numel() == 0:
+            # If there are no valid tokens, return a zero mask
+            return torch.zeros_like(entropies, dtype=torch.bool)
+        
+        entropy_threshold = torch.quantile(gathered, threshold)
+        masked_entropies = entropies * mask.float()
+        entropy_mask = (masked_entropies >= entropy_threshold).bool()
+
+        return entropy_mask # Return shape is (batch_size, seq_len)
+
+    def _get_per_token_logps_and_entropies(self, logits: torch.Tensor, labels: torch.Tensor,
+                                           mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+            Per-token Log Probabilities and Entropies Computation
+
+            Args:
+                - logits (torch.Tensor): Logits from the model of shape (batch_size, seq_len, vocab_size)
+                - labels (torch.Tensor): Ground truth token IDs of shape (batch_size, seq_len)
+                - mask (torch.Tensor): Attention mask of shape (batch_size, seq_len)
+
+            Returns:
+                - log_probs (torch.Tensor): Per-token log probabilities of shape (batch_size, seq_len)
+                - entropies (torch.Tensor): Per-token entropies of shape (batch_size, seq_len) 
+        """
+        # Shift logits and Labels for Causal LM
+        shift_logits = logits[:, :-1, :].contiguous()  # (batch_size, seq_len - 1, vocab_size)
+        shift_labels = labels[:, 1:].contiguous()      # (batch_size, seq_len - 1)
+        shift_mask = mask[:, 1:].contiguous()          # (batch_size, seq_len - 1)
+
+        # Log Probabilities
+        log_probs_
 
     def _prepare_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
 
