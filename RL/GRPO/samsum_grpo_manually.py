@@ -13,13 +13,12 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 import evaluate
 from pathlib import Path
-from tqdm import tqdm
+import tqdm
 import torch.nn.functional as F
 
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 
-from trl.trainer.utils import RepeatSampler
-
+import gc
 # from transformers import Trainer, TrainingArguments # Not used Version
 
 """
@@ -181,21 +180,18 @@ class GRPOSampler:
             
             Returns:
                 - generated_ids: Tensor of shape (batch_size, group_size, seq_len)
-                - old_log_probs: Tensor of shape (batch_size, group_size, gen_len) - from generation
-                - log_probs: Tensor of shape (batch_size, group_size, seq_len) - current policy
-                - ref_log_probs: Tensor of shape (batch_size, group_size, seq_len) - reference policy
+                - log_probs: Tensor of shape (batch_size, group_size, seq_len)
+                - ref_log_probs: Tensor of shape (batch_size, group_size, seq_len)
         """
-        # self.model.eval()
+        self.model.eval()
         batch_size = input_ids.size(0)
         device = input_ids.device
 
         model_to_use = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
         all_generated_ids = [] 
-        all_old_log_probs = []
         max_length = 0
 
-        model_to_use.eval()
         # Generate K Samples
         with torch.no_grad():
             for k in range(self.group_size):
@@ -209,35 +205,15 @@ class GRPOSampler:
                     top_p = self.top_p,
                     pad_token_id = self.tokenizer.eos_token_id,
                     eos_token_id = self.tokenizer.eos_token_id,
-                    # return_dict_in_generate = False,
-                    return_dict_in_generate = True, # Changed for getting scores -- use .sequences
-                    output_scores = True,
+                    return_dict_in_generate = False,
                     use_cache = False
                 )
-                # Extract generated sequences
-                gen_sequences = generated_outputs.sequences  # (batch_size, seq_len)
-                all_generated_ids.append(gen_sequences)
-                max_length = max(max_length, gen_sequences.size(1))
-
-                # Compute old log probs during generation
-                old_log_probs = []
-                for index, score in enumerate(generated_outputs.scores):
-                    # Score shape: (batch_size, vocab_size)
-                    log_probs_step = F.log_softmax(score, dim=-1)
-                    # Get the log probs of the generated tokens at this step
-                    selected_token = gen_sequences[:, input_ids.size(1) + index]  # (batch_size,)
-                    token_log_probs = log_probs_step.gather(1, selected_token.unsqueeze(-1)).squeeze(-1)  # (batch_size,)
-                    old_log_probs.append(token_log_probs)
-
-                if old_log_probs:
-                    old_log_probs = torch.stack(old_log_probs, dim=1)  # (batch_size, gen_len)
-                    all_old_log_probs.append(old_log_probs)
-
+                all_generated_ids.append(generated_outputs)
+                max_length = max(max_length, generated_outputs.size(1))
+        
         # Pad all sequences to max_length
         padded_ids = []
-        padded_old_log_probs = []
-    
-        for generate_idx, old_lp in zip(all_generated_ids, all_old_log_probs):
+        for generate_idx in all_generated_ids:
             if generate_idx.size(1) < max_length:
                 padding = torch.full(
                     (generate_idx.size(0), max_length - generate_idx.size(1)),
@@ -248,22 +224,8 @@ class GRPOSampler:
                 generate_idx = torch.cat([generate_idx, padding], dim=1)
             padded_ids.append(generate_idx)
 
-            # Pad old log probs with zeros
-            gen_len = old_lp.size(1)
-            target_gen_len = max_length - input_ids.size(1)
-            if gen_len < target_gen_len:
-                padding = torch.zeros(
-                    (old_lp.size(0), target_gen_len - gen_len),
-                    dtype=old_lp.dtype,
-                    device=device
-                )
-                old_lp = torch.cat([old_lp, padding], dim=1)
-            padded_old_log_probs.append(old_lp)
-
         generated_ids = torch.stack(padded_ids, dim=1)  # (batch_size, group_size, seq_len)
-        old_log_probs = torch.stack(padded_old_log_probs, dim=1)  # (batch_size, group_size, gen_len)
-
-        model_to_use.train()
+        self.model.train()
 
         # Compute Log Probabilities in batched manner (which TRL does)
         log_probs, ref_log_probs = self._compute_log_probs(
@@ -271,7 +233,7 @@ class GRPOSampler:
             input_length = input_ids.size(1)
         )
 
-        return generated_ids, old_log_probs, log_probs, ref_log_probs
+        return generated_ids, log_probs, ref_log_probs
 
     def _compute_log_probs(self, generated_ids: torch.Tensor, input_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -395,12 +357,11 @@ class GRPOLossCalculator:
             - Per-token loss computation with masking.
             - KL Divergence penalty to maintain alignment with the reference model.
     """
-    def __init__(self, beta: float = 0.1, epsilon: float = 0.2):
+    def __init__(self, beta: float = 0.1):
         self.beta = beta
-        self.epsilon = epsilon
 
     def compute_loss(self, log_probs: torch.Tensor, 
-                     ref_log_probs: torch.Tensor, old_log_probs: torch.Tensor,
+                     ref_log_probs: torch.Tensor,
                      advantages: torch.Tensor,
                      attention_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -419,54 +380,32 @@ class GRPOLossCalculator:
                     - avg_policy_loss: Average policy loss across the batch.    
         """
         log_probs = log_probs.float() 
-        old_log_probs = old_log_probs.float()
         ref_log_probs = ref_log_probs.float()
-        
         advantages = advantages.float()
-        attention_mask = attention_mask.float()
+        attention_mask = attention_mask.float() # Need to check for the shape
 
-        # Count for valid tokens
-        token_counts = attention_mask.sum(dim=-1)
-        total_token = token_counts.sum()
+        if attention_mask.sum().item() == 0:
+            return torch.tensor(0.0, device=log_probs.device), {'total_loss': 0.0, 'policy_loss': 0.0, 'kl_divergence': 0.0, 'mean_advantage': 0.0, 'std_advantage': 0.0}
 
-        if token_counts.item() == 0:
-             return torch.tensor(0.0, device=log_probs.device), {'total_loss': 0.0, 'policy_loss': 0.0, 'kl_divergence': 0.0, 'mean_advantage': 0.0, 'std_advantage': 0.0}
+        # 1. Policy Ratio
+        log_ratio = log_probs - ref_log_probs  # (batch_size, group_size, seq_len)
+        ratio = torch.exp(log_ratio)           # (batch_size, group_size, seq_len
 
-        # 1. Sampling Ratio: \pi_{new}(a|s) / \pi_{old}(a|s)
-        ratio_per_token = torch.exp(log_probs - old_log_probs)  # (batch_size, group_size, seq_len)
+        # 2. Policy Loss
+        advantages = advantages.unsqueeze(-1)  # (batch_size, group_size, 1)
+        policy_loss_per_token = -ratio * advantages * attention_mask  # (batch_size, group_size, seq_len)
+        policy_loss = policy_loss_per_token.sum() / (attention_mask.sum() + 1e-8)  # Scalar
 
-        # 2. Expand advantages for per-token multiplication
-        advantages_expanded = advantages.unsqueeze(-1)  # (batch_size, group_size, 1)
+        # 3. KL Divergence
+        kl_loss = (log_ratio * attention_mask).sum() / (attention_mask.sum() + 1e-8)  # Scalar
 
-        # PPO based clipped objective
-        # 2-1. Policy Gradient Loss 1: Unclipped
-        surrogate_objective_unclipped = ratio_per_token * advantages_expanded  # (batch_size, group_size, seq_len)
-
-        # 2-2. Policy Gradient Loss 2: Clipped
-        # Clip the surrogate objective (ratio, 1-epsilon, 1+epsilon) * A
-        surrogate_objective_clipped = torch.clamp(
-            ratio_per_token,
-            1.0 - self.epsilon,
-            1.0 + self.epsilon
-        ) * advantages_expanded
-
-        # 2-3. Final per-token objective
-        per_token_objective = torch.min(surrogate_objective_unclipped, surrogate_objective_clipped)
-
-        # Apply mask and compute policy loss
-        masked_policy_gradient_loss = - per_token_objective * attention_mask  # (batch_size, group_size, seq_len)
-        policy_loss = masked_policy_gradient_loss.sum() / total_token
-        
-        kl_divergence_per_token = log_probs - ref_log_probs  # (batch_size, group_size, seq_len)
-        masked_kl_divergence = kl_divergence_per_token * attention_mask  # (batch_size, group_size, seq_len)
-        kl_divergence = masked_kl_divergence.sum() / total_token
-
-        total_loss = policy_loss + self.beta * kl_divergence
+        # 4. Total Loss
+        total_loss = policy_loss + self.beta * kl_loss
 
         # Metrics Dictionary
         metrics = {
             'policy_loss': policy_loss.item(),
-            'kl_divergence': kl_divergence.item(),
+            'kl_divergence': kl_loss.item(),
             'total_loss': total_loss.item(),
             'mean_advantage': advantages.mean().item(),
             'std_advantage': advantages.std().item()
@@ -479,7 +418,7 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
                      tokenizer: AutoTokenizer, dataloader: DataLoader,
                      optimizer: torch.optim.Optimizer, device: torch.device,
                      num_epochs: int = 3, group_size: int = 4, 
-                     temperature: float = 1.0, beta: float = 0.1, epoch: int = 0, epsilon: float = 0.2) -> Dict[str, List[float]]:
+                     temperature: float = 1.0, beta: float = 0.1) -> Dict[str, List[float]]:
     model.train()
     reference_model.eval()
 
@@ -496,24 +435,21 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
         temperature = temperature
     )
     reward_calculator = ROUGERewardCalculator()
-    loss_calculator = GRPOLossCalculator(beta = beta, epsilon = epsilon)
+    loss_calculator = GRPOLossCalculator(beta = beta)
 
-    progress_bar = tqdm(range(len(dataloader)), desc=f"Training GRPO Epoch {epoch+1}/{num_epochs}", ncols=100)
-
-    # 
     for step, batch in enumerate(dataloader):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         reference_summaries = batch["summaries"]
 
         # 1. Generate group samples
-        generated_ids, old_log_probs, log_probs, ref_log_probs = sampler.generate_group_samples(
+        generated_ids, log_probs, ref_log_probs = sampler.generate_group_samples(
             input_ids=input_ids,
             attention_mask=attention_mask,
             max_new_tokens=32
         )
 
-        batch_size, group_size, _ = generated_ids.size() # (batch_size, group_size, seq_len)
+        batch_size, group_size, total_seq_len = generated_ids.size()
         gen_seq_len = log_probs.size(2)
 
         # 2. Decode and compute rewards
@@ -545,7 +481,6 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
         # 5. Compute GRPO loss (TRL-style)
         loss, metrics = loss_calculator.compute_loss(
             log_probs=log_probs,
-            old_log_probs=old_log_probs,
             ref_log_probs=ref_log_probs,
             advantages=advantages,
             attention_mask=attention_mask_gen
@@ -561,7 +496,7 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
         total_reward += rewards.mean().item()
         total_policy_loss += metrics['policy_loss']
         total_kl_divergence += metrics['kl_divergence']
-
+        
         if (step + 1) % 1 == 0:
             print(f" >> Step [{step+1}/{len(dataloader)}], Loss: {loss.item():.4f}, "
                   f"Avg Reward: {rewards.mean().item():.4f}, "
@@ -583,6 +518,12 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
                       f"| Reward: {rewards[display_batch_index, k].item():.4f} "
                       f"| Adv: {advantages[display_batch_index, k].item():.4f}")
             print(" -------------------------------------------------------------------")
+
+        # Flush for Memory Efficiency
+        if (step + 1) % 20 == 0:
+            torch.cuda.empty_cache()
+            gc.collect()
+            print(" >> Completed garbage collection after training.")
 
     avg_metrics = {
         "loss": total_loss / len(dataloader),
@@ -618,7 +559,7 @@ def evaluate_grpo_llama(model: nn.Module, reference_model: nn.Module,
                 attention_mask=attention_mask,
                 max_new_tokens=32
             )
-            batch_size, group_size, _ = generated_ids.size() # (batch_size, group_size, seq_len)
+            batch_size, group_size, total_seq_len = generated_ids.size()
 
             generated_texts = []
             for batch_idx in range(batch_size):
@@ -659,7 +600,7 @@ def evaluate_grpo_llama(model: nn.Module, reference_model: nn.Module,
     all_rewards = torch.cat(all_rewards, dim=0)
 
     results = {
-        'avg_reward': all_rewards.mean().item(),
+        'mean_reward': all_rewards.mean().item(),
         'max_reward': all_rewards.max().item(),
         'min_reward': all_rewards.min().item(),
         'std_reward': all_rewards.std().item(),
@@ -770,10 +711,12 @@ def main():
     model = get_peft_model(model, lora_config)
 
     # Set Reference model with LoRA (frozen)
-    import copy
-    reference_model = copy.deepcopy(model)
-    reference_model = get_peft_model(reference_model, lora_config)
-    reference_model.gradient_checkpointing_disable()
+    reference_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config = bnb_config,
+        device_map = "auto"
+    )
+    # reference_model = get_peft_model(reference_model, lora_config)
     for param in reference_model.parameters():
         param.requires_grad = False # Freeze the reference model, which means no gradient computation.
     reference_model.eval()
@@ -790,10 +733,8 @@ def main():
         "learning_rate": 5e-5,
         "temperature": 0.7,
         "beta": 0.1,
-        "epsilon": 0.2,
         "top_k": 50,
         "top_p": 0.9,
-        "steps_per_generation": 1
     }
 
     for key, value in grpo_config.items():
@@ -804,21 +745,10 @@ def main():
     train_dataset = dataset["train"].shuffle(seed=42)
     val_dataset = dataset["validation"].shuffle(seed=42)
 
-    # Use RepeatSampler
-    train_sampler = RepeatSampler(
-        data_source = train_dataset,
-        batch_size = grpo_config["batch_size"],
-        mini_repeat_count = grpo_config["group_size"],
-        shuffle = True,
-        repeat_count = grpo_config["steps_per_generation"],
-        seed = 42
-    )
-
     train_loader = DataLoader(
         train_dataset,
-        batch_sampler = train_sampler,
-        batch_size = 1,
-        shuffle = False,
+        batch_size = grpo_config["batch_size"],
+        shuffle = True,
         collate_fn = lambda batch: grpo_collate_fn(batch, tokenizer)
     )
 
@@ -861,8 +791,7 @@ def main():
             num_epochs = grpo_config["num_epochs"],
             group_size = grpo_config["group_size"],
             temperature = grpo_config["temperature"],
-            beta = grpo_config["beta"],
-            epsilon= grpo_config["epsilon"],
+            beta = grpo_config["beta"]
         )
 
         print(f"\n >> Epoch {epoch + 1} Training Results:")
@@ -870,6 +799,11 @@ def main():
         print(f"    - Avg Reward: {train_metrics['avg_reward']:.4f}")
         print(f"    - KL Divergence: {train_metrics['avg_kl_divergence']:.4f}")
         print(f"   - Policy Loss: {train_metrics['avg_policy_loss']:.4f}")
+
+        del train_metrics
+        torch.cuda.empty_cache()
+        gc.collect()
+        print(" >> Completed garbage collection after training.")
 
         # Evaluation
         print(f" >> Evaluating after Epoch {epoch + 1} for Validation Set...")
@@ -884,20 +818,21 @@ def main():
 
         print(f"\n >> Epoch {epoch + 1} Evaluation Results:")
         print(f"    - ROUGE-1: {eval_results['rouge1']:.4f}")
+        print(f"    - ROUGE-2: {eval_results['rouge2']:.4f}")
         print(f"    - ROUGE-L: {eval_results['rougeL']:.4f}")
-        print(f"    - Avg Reward: {eval_results['avg_reward']:.4f}")
-        print(f"    - Reward Std: {eval_results['reward_std']:.4f}")
+        print(f"   - Avg Reward: {eval_results['avg_reward']:.4f}")
+        print(f"   - Reward Std: {eval_results['reward_std']:.4f}")
 
         # Print Sample Summaries
-        # print("\n >> Sample Summaries:")
-        # if eval_results["samples"]:
-        #     print(f"    - Dialogue: {eval_results['samples'][0]['dialogue']}")
-        #     for i, sample in enumerate(eval_results["samples"]):
-        #         print(f"  [Generated Sample {i + 1}]")
-        #         print(f"    - Reference Summary: {sample['reference_summary']}")
-        #         print(f"    - Generated Summary: {sample['generated_summary']}\n")
-        #         # For every sample, print the reference and generated summary.
-        #         # NEED TO FIXX
+        print("\n >> Sample Summaries:")
+        if eval_results["samples"]:
+            print(f"    - Dialogue: {eval_results['samples'][0]['dialogue']}")
+            for i, sample in enumerate(eval_results["samples"]):
+                print(f"  [Generated Sample {i + 1}]")
+                print(f"    - Reference Summary: {sample['reference_summary']}")
+                print(f"    - Generated Summary: {sample['generated_summary']}\n")
+                # For every sample, print the reference and generated summary.
+                # NEED TO FIXX
 
         # Save Checkpoint
         metrics_dict = {
@@ -906,6 +841,7 @@ def main():
             "kl_divergence": train_metrics["avg_kl_divergence"],
             "policy_loss": train_metrics["avg_policy_loss"],
             "rouge1": eval_results["rouge1"],
+            "rouge2": eval_results["rouge2"],
             "rougeL": eval_results["rougeL"]
         }
         checkpoint_callback.on_epoch_end(epoch, metrics_dict, model)
