@@ -4,6 +4,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import warnings
 warnings.filterwarnings("ignore")
 
+import wandb
+import time
+
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -210,6 +213,17 @@ class GRPOSampler:
                 )
                 all_generated_ids.append(generated_outputs)
                 max_length = max(max_length, generated_outputs.size(1))
+                """
+                When extract logits from the generated outputs, 
+                Checked that Input and Generated sequences are concatenated together.
+
+                (Pdb) self.tokenizer.decode(input_ids[0])
+                '...leftPadding...<|eot_id|><|eot_id|><|eot_id|><|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 30 Oct 2025\n\nYou are an expert dialogue summarization assistant. Summarize the following dialogue concisely, in English.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nLeanne: are you in so I can collect mums post?\nSue: yes of course I will get it ready\nLeanne: I will stop for a quick cuppa if you have time?\nSue: yes that will be nice\nLeanne: I will bring us a cake\nSue: even better xx<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n'
+                (Pdb) self.tokenizer.decode(all_generated_ids[0][0])
+                '...leftPadding...<|eot_id|><|eot_id|><|eot_id|><|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 30 Oct 2025\n\nYou are an expert dialogue summarization assistant. Summarize the following dialogue concisely, in English.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nLeanne: are you in so I can collect mums post?\nSue: yes of course I will get it ready\nLeanne: I will stop for a quick cuppa if you have time?\nSue: yes that will be nice\nLeanne: I will bring us a cake\nSue: even better xx<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHere is a concise summary of the dialogue:\n\nLeanne asks Sue to collect a package from the post office, and Sue agrees. They also plan to stop for'
+                """
+
+        # breakpoint()
         
         # Pad all sequences to max_length
         padded_ids = []
@@ -388,8 +402,11 @@ class GRPOLossCalculator:
             return torch.tensor(0.0, device=log_probs.device), {'total_loss': 0.0, 'policy_loss': 0.0, 'kl_divergence': 0.0, 'mean_advantage': 0.0, 'std_advantage': 0.0}
 
         # 1. Policy Ratio
-        log_ratio = log_probs - ref_log_probs  # (batch_size, group_size, seq_len)
+        log_ratio = log_probs - log_probs.detach()  # (batch_size, group_size, seq_len)
         ratio = torch.exp(log_ratio)           # (batch_size, group_size, seq_len
+        """
+        why we need ratio here?
+            """
 
         # 2. Policy Loss
         advantages = advantages.unsqueeze(-1)  # (batch_size, group_size, 1)
@@ -501,6 +518,15 @@ def train_grpo_llama(model: nn.Module, reference_model: nn.Module,
             print(f" >> Step [{step+1}/{len(dataloader)}], Loss: {loss.item():.4f}, "
                   f"Avg Reward: {rewards.mean().item():.4f}, "
                   f"KL: {metrics['kl_divergence']:.4f}")
+            
+            step_log_data = {
+                "train/loss": loss.item(),
+                "train/avg_reward": rewards.mean().item(),
+                "train/kl_divergence": metrics['kl_divergence'],
+                "train/step_policy_loss": metrics['policy_loss'],
+                "train/step_mean_advantage": metrics['mean_advantage'],
+            }
+            wandb.log(step_log_data, step=(num_epochs * len(dataloader) + step))
             
             # Print sample outputs
             display_batch_index = 0
@@ -704,7 +730,8 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config = bnb_config,
-        device_map = "auto"
+        device_map = "auto",
+        dtype = torch.float16
     )
     model.gradient_checkpointing_enable()
     model = prepare_model_for_kbit_training(model)
@@ -714,7 +741,8 @@ def main():
     reference_model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config = bnb_config,
-        device_map = "auto"
+        device_map = "auto",
+        dtype = torch.float16
     )
     # reference_model = get_peft_model(reference_model, lora_config)
     for param in reference_model.parameters():
@@ -730,7 +758,7 @@ def main():
         "num_epochs": 3,
         "batch_size": 2,
         "group_size": 4,
-        "learning_rate": 5e-5,
+        "learning_rate": 1e-5,
         "temperature": 0.7,
         "beta": 0.1,
         "top_k": 50,
@@ -739,6 +767,13 @@ def main():
 
     for key, value in grpo_config.items():
         print(f"    - {key}: {value}") 
+
+    run_name = f"grpo_{time.strftime('%Y%m%d_%H%M%S')}_groupsize{grpo_config['group_size']}_bs{grpo_config['batch_size']}_lr{grpo_config['learning_rate']}_epochs{grpo_config['num_epochs']}"
+    wandb.init(
+        project = "GRPO",
+        name = run_name,
+        config = grpo_config
+    )
 
     # Prepare DataLoaders
     print(" >> Preparing DataLoaders...")
@@ -823,6 +858,20 @@ def main():
         print(f"   - Avg Reward: {eval_results['avg_reward']:.4f}")
         print(f"   - Reward Std: {eval_results['reward_std']:.4f}")
 
+        epoch_log_data = {
+            "epoch": epoch + 1,
+            "train/loss": train_metrics["loss"],
+            "train/avg_reward": train_metrics["avg_reward"],
+            "train/kl_divergence": train_metrics["avg_kl_divergence"],
+            "train/policy_loss": train_metrics["avg_policy_loss"],
+            "train/mean_advantage": train_metrics["avg_mean_advantage"],
+            "eval/rouge1": eval_results["rouge1"],
+            "eval/rouge2": eval_results["rouge2"],
+            "eval/rougeL": eval_results["rougeL"],
+            "eval/avg_reward": eval_results["avg_reward"],
+            "eval/reward_std": eval_results["std_reward"]
+        }
+
         # Print Sample Summaries
         print("\n >> Sample Summaries:")
         if eval_results["samples"]:
@@ -859,6 +908,7 @@ def main():
         model_name = "grpo_samsum_llama3.2_3b"
     )
     print(f" >> Final model saved at {final_save_path}")
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
