@@ -502,12 +502,16 @@ class GRPOLossCalculator:
         advantages = advantages.float()
         attention_mask = attention_mask.float() # Need to check for the shape
 
+        breakpoint()
+
         if attention_mask.sum().item() == 0:
             return torch.tensor(0.0, device=log_probs.device), {'total_loss': 0.0, 'policy_loss': 0.0, 'kl_divergence': 0.0, 'mean_advantage': 0.0, 'std_advantage': 0.0}
 
         # 1. Policy Ratio
         log_ratio = log_probs - log_probs.detach()  # (batch_size, group_size, seq_len)
         ratio = torch.exp(log_ratio)           # (batch_size, group_size, seq_len
+
+        breakpoint()
         """
         why we need ratio here?
             """
