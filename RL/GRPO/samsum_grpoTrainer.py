@@ -1,3 +1,4 @@
+from asyncio import subprocess
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1" #"0,1"
 
@@ -100,7 +101,18 @@ def compute_rouge_reward_batch(prompts: List[str], completions: List[str],
         rewards.append(float(score))
     return rewards
 
-def main():
+def train_vllm_server_mode() -> None:
+    env_copy = os.environ.copy()
+    env_copy["CUDA_VISIBLE_DEVICES"] = "0" # Run vLLM server on GPU 0
+
+    # Start vLLM server in a separate process
+    subprocess.Popen(
+        ["trl", "vllm-server", "--model", "meta-llama/Llama-3.2-3B-Instruct"], env=env_copy
+    )
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use GPU 1 for training
+    main(use_vllm=True, vllm_mode="server")
+
+def main(use_vllm: Optional[bool] = True, vllm_mode = None) -> None:
     print(" >> Fine-tuning using GRPOTrainer << ")
     
     # 1. Load and prepare SAMSum dataset
@@ -217,7 +229,10 @@ def main():
         report_to="wandb",
 
         use_vllm=True,
+
         # vllm_device="cuda:0",
+        # fast_inference=False,
+        dataloader_drop_last=True
 
     )
     
